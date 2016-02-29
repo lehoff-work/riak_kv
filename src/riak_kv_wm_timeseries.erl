@@ -23,10 +23,10 @@
 %% @doc Resource for Riak TS operations over HTTP.
 %%
 %% ```
-%% GET    /ts/v1/table/Table          single-key get
-%% DELETE /ts/v1/table/Table          single-key delete
-%% PUT    /ts/v1/table/Table          batch put
-%% GET    /ts/v1/coverage             coverage for a query
+%% GET     /ts/v1/table/Table/keys/K1/V1/...  single-key get
+%% DELETE  /ts/v1/table/Table/keys/K1/V1/...  single-key delete
+%% POST    /ts/v1/table/Table/keys            singe-key or batch put depending
+%%                                            on the body
 %% '''
 %%
 %% Request body is expected to be a JSON containing key and/or value(s).
@@ -65,7 +65,7 @@
               security,     %% security context
               client,       %% riak_client() - the store client
               riak,         %% local | {node(), atom()} - params for riak client
-              api_call :: undefined|get|put|delete|coverage,
+              api_call :: undefined|get|put|delete,
               table    :: undefined | binary(),
               %% data in/out: the following fields are either
               %% extracted from the JSON/path elements that came in
@@ -200,153 +200,118 @@ preexec(RD, Ctx) ->
     end.
 
 -spec validate_request(#wm_reqdata{}, #ctx{}) -> ?CB_RV_SPEC.
-validate_request(RD, Ctx) ->
+validate_request(RD, #ctx{method=Method} = Ctx) ->
     case wrq:path_info(api_version, RD) of
         "v1" ->
-            validate_request_v1(RD, Ctx);
+            Table = wrq:path_info(table, RD),
+            case table_module_exists(Table) of
+                true ->
+                    validate_request_v1(wrq:path_tokens(RD), Method,
+                                        Table, RD, Ctx);
+                false ->
+                    handle_error({no_such_table, Table}, RD, Ctx)
+            end;
         BadVersion ->
             handle_error({unsupported_version, BadVersion}, RD, Ctx)
     end.
 
--spec validate_request_v1(#wm_reqdata{}, #ctx{}) -> ?CB_RV_SPEC.
-validate_request_v1(RD, Ctx) ->
-    case string:tokens(wrq:path(RD), "/") of
-        ["ts", "v1", "tables", Table, "keys" | KeysInUrl]
-          when KeysInUrl /= [] ->
-            KeysInUrlUnquoted = lists:map(fun mochiweb_util:unquote/1, KeysInUrl),
-            validate_request_v1_with({Table, KeysInUrlUnquoted}, RD, Ctx);
-        _ ->
-            validate_request_v1_with(json, RD, Ctx)
-    end.
 
--spec validate_request_v1_with(json | {string(), [string()]}, #wm_reqdata{}, #ctx{}) ->
-                                      ?CB_RV_SPEC.
-validate_request_v1_with(json, RD, Ctx = #ctx{method = Method}) ->
-    Json = extract_json(RD),
-    case {Method, string:tokens(wrq:path(RD), "/"),
-          extract_data(Json), extract_query(Json)} of
-        %% batch put
-        {'PUT',
-         ["ts", "v1", "tables", Table, "keys"],
-         Data, _}
-          when is_list(Table), Data /= undefined ->
-            valid_params(
+-spec validate_request_v1([string()], atom(), string(), #wm_reqdata{}, #ctx{}) -> ?CB_RV_SPEC.
+%% this is a POST on create with data in the body
+validate_request_v1([], 'POST', Table, RD, Ctx) when is_list(Table) ->
+    try
+        Data = binary_to_list(wrq:req_body(RD)),
+        valid_params(
               RD, Ctx#ctx{api_version = "v1", api_call = put,
-                          table = list_to_binary(Table), data = Data});
-        %% coverage
-        {'GET',
-         ["ts", "v1", "coverage"],
-         undefined, Query}
-          when is_list(Query) ->
-            valid_params(
-              RD, Ctx#ctx{api_version = "v1", api_call = coverage,
-                          query = Query});
-        _Invalid ->
-            handle_error({malformed_request, Method}, RD, Ctx)
+                          table = list_to_binary(Table), data = Data})
+    catch
+        _E:_T ->
+            handle_error({malformed_request, 'POST'}, RD, Ctx)
     end;
+validate_request_v1(KeysInUrl, GetOrDelete, Table, RD, Ctx) when is_list(Table),
+                                                                 length(KeysInUrl) rem 2 == 0,
+                                                                 (GetOrDelete == 'GET' orelse
+                                                                  GetOrDelete == 'DELETE')->
+    try
+        Key = validate_key(KeysInUrl, Table),
+        valid_params(RD,
+                    Ctx#ctx{api_version = "v1",
+                            api_call = http_verb_to_api_call(GetOrDelete),
+                            table = list_to_binary(Table), key = Key})
+    catch
+        error:Reason ->
+            handle_error(Reason, RD, Ctx)
+    end;
+validate_request_v1(_KeysInUrl, GetOrDelete, _Table, RD, Ctx) when GetOrDelete== 'GET';
+                                                                   GetOrDelete== 'DELETE' ->
+    handle_error(url_unpaired_key, RD, Ctx);
+validate_request_v1(_PathTokens, Method, _Table, RD, Ctx) ->
+    handle_error({malformed_request, Method}, RD, Ctx).
 
-validate_request_v1_with({Table, KeysInUrl}, RD, Ctx = #ctx{method = Method}) ->
-    %% only get and delete can have keys in url
-    case {Method,
-          path_elements_to_key(Table, KeysInUrl)} of
-        {'GET', {ok, Key}} ->
-            valid_params(
-              RD, Ctx#ctx{api_version = "v1", api_call = get,
-                          table = list_to_binary(Table), key = Key});
-        %% single-key delete
-        {'DELETE', {ok, Key}} ->
-            valid_params(
-              RD, Ctx#ctx{api_version = "v1", api_call = delete,
-                          table = list_to_binary(Table), key = Key});
-        {_, {error, Reason}} ->
-            handle_error(Reason, RD, Ctx);
-        {'PUT', _} ->
-            handle_error(url_key_with_put, RD, Ctx)
+
+http_verb_to_api_call('GET') ->
+    get;
+http_verb_to_api_call('DELETE') ->
+    delete.
+
+table_module_exists(Mod) ->
+    try Mod:get_dll() of
+        #ddl_v1{} ->
+            true
+    catch
+        _:_ ->
+            false
     end.
+
+validate_key(Keys, Table) ->
+    Mod = riak_ql_ddl:make_module_name(list_to_binary(Table)),
+    UnquotedKeys = lists:map(fun mochiweb_util:unquote/1, Keys),
+    FVList = path_elements_to_key(Table, Mod, UnquotedKeys),
+    ensure_lk_order_and_strip(Mod, FVList).
 
 %% extract keys from path elements in the URL (.../K1/V1/K2/V2 ->
 %% [{K1, V1}, {K2, V2}]), check with Table's DDL to make sure keys are
 %% correct and values are of (convertible to) appropriate types, and
 %% return the KV list
--spec path_elements_to_key(string(), [string()]) ->
+-spec path_elements_to_key(string(), atom(), [string()]) ->
                                   {ok, [{string(), riak_pb_ts_codec:ldbvalue()}]} |
                                   {error, atom()|tuple()}.
-path_elements_to_key(Table, PEList) ->
-    Mod = riak_ql_ddl:make_module_name(list_to_binary(Table)),
-    try
-        DDL = Mod:get_ddl(),
-        #ddl_v1{local_key = #key_v1{ast = LK}} = DDL,
-        TableKeyLength = length(LK),
-        if TableKeyLength * 2 == length(PEList) ->
-                %% values with field names:  "f1/v1/f2/v2/f3/v3"
-                %% 1. check that supplied key fields exist and values
-                %% supplied are convertible to their types
-                FVList =
-                    [convert_fv(Table, Mod, K, V)
-                     || {K, V} <- empair(PEList, [])],
-                %% 2. possibly reorder field-value pairs to match the LK order
-                OrderedKeyValues =
-                    ensure_lk_order_and_strip(DDL, FVList),
-                {ok, OrderedKeyValues};
-           TableKeyLength == length(PEList) ->
-                %% bare values: "v1/v2/v3"
-                %% 1. retrieve field values from the DDL
-                Fields = [F || #param_v1{name = F} <- LK],
-                FVList =
-                    [convert_fv(Table, Mod, K, V)
-                     || {K, V} <- lists:zip(Fields, PEList)],
-                {_, OrderedKeyValues} =
-                    lists:unzip(FVList),
-                {ok, OrderedKeyValues};
-           el/=se ->
-                {error, url_unpaired_keys}
-        end
-    catch
-        error:undef ->
-            {error, {no_such_table, Table}};
-        throw:ConvertFailed ->
-            {error, ConvertFailed}
-    end.
-
-empair([], Q) -> lists:reverse(Q);
-empair([K, V | T], Q) -> empair(T, [{K, V}|Q]).
+path_elements_to_key(_Table, _Mod, []) ->
+    [];
+path_elements_to_key(Table, Mod, [F,V|Rest]) ->
+    [convert_fv(Table, Mod, F, V)|path_elements_to_key(Table, Mod, Rest)].
 
 convert_fv(Table, Mod, FieldRaw, V) ->
     Field = [list_to_binary(X) || X <- string:tokens(FieldRaw, ".")],
     try
-        case Mod:is_field_valid(Field) of
-            true ->
-                case Mod:get_field_type(Field) of
-                    varchar ->
-                        {Field, list_to_binary(V)};
-                    sint64 ->
-                        {Field, list_to_integer(V)};
-                    double ->
-                        %% list_to_float("42") will fail, so
-                        try
-                            {Field, list_to_float(V)}
-                        catch
-                            error:badarg ->
-                                {Field, float(list_to_integer(V))}
-                        end;
-                    timestamp ->
-                        case list_to_integer(V) of
-                            BadValue when BadValue < 1 ->
-                                throw({url_key_bad_value, Table, Field});
-                            GoodValue ->
-                                {Field, GoodValue}
-                        end
-                end;
-            false ->
-                throw({url_key_bad_key, Table, Field})
-        end
+        true = Mod:is_field_valid(Field),
+        convert_field_value(Mod:get_field_type(Field), V)
     catch
-        error:badarg ->
-            %% rethrow with key, for more informative reporting
-            throw({url_key_bad_value, Table, Field})
+        _:_ ->
+           error({url_key_bad_value, Table, Field})
     end.
 
-ensure_lk_order_and_strip(#ddl_v1{local_key = #key_v1{ast = LK}}, FVList) ->
+convert_field_value(varchar, V) ->
+    list_to_binary(V);
+convert_field_value(sint64, V) ->
+    list_to_integer(V);
+convert_field_value(double, V) ->
+    try
+        list_to_float(V)
+    catch
+        error:badarg ->
+            float(list_to_integer(V))
+    end;
+convert_field_value(timestamp, V) ->
+    case list_to_integer(V) of
+        GoodValue when GoodValue > 0 ->
+            GoodValue;
+        _ ->
+            error(url_key_bad_value)
+    end.
+
+ensure_lk_order_and_strip(Mod, FVList) ->
+    #ddl_v1{local_key = #key_v1{ast = LK}} = Mod:get_ddl(),
     [proplists:get_value(F, FVList)
      || #param_v1{name = F} <- LK].
 
@@ -364,77 +329,6 @@ valid_params(RD, Ctx) ->
                     handle_error({bad_parameter, "timeout"}, RD, Ctx)
             end
     end.
-
-%% This is a special case for curl -G.  `curl -G host --data $data`
-%% will send the $data in URL instead of in the body, so we try to
-%% look for it in req_qs.
-extract_json(RD) ->
-    case proplists:get_value("json", RD#wm_reqdata.req_qs) of
-        undefined ->
-            %% if it was a PUT or POST, data is in body
-            binary_to_list(wrq:req_body(RD));
-        BodyInPost ->
-            BodyInPost
-    end.
-
-%% because, techically, key and data are 'arguments', we check they
-%% are well-formed, too.
--spec extract_data(binary()) -> term().
-extract_data(Json) ->
-    try mochijson2:decode(Json) of
-        {struct, Decoded} when is_list(Decoded) ->
-            %% key and data (it's a put)
-            validate_ts_records(
-              proplists:get_value(<<"data">>, Decoded))
-    catch
-        _:_ ->
-            undefined
-    end.
-
--spec extract_query(binary()) -> term().
-extract_query(Json) ->
-    try mochijson2:decode(Json) of
-        {struct, Decoded} when is_list(Decoded) ->
-            validate_ts_query(
-              proplists:get_value(<<"query">>, Decoded))
-    catch
-        _:_ ->
-            undefined
-    end.
-
-
-validate_ts_record(undefined) ->
-    undefined;
-validate_ts_record(R) when is_list(R) ->
-    case lists:all(
-           %% check that all list elements are TS types
-           fun(X) -> is_integer(X) orelse is_float(X) orelse is_binary(X) end,
-           R) of
-        true ->
-            R;
-        false ->
-            undefined
-    end;
-validate_ts_record(_) ->
-    undefined.
-
-validate_ts_records(undefined) ->
-    undefined;
-validate_ts_records(RR) when is_list(RR) ->
-    case lists:all(fun(R) -> validate_ts_record(R) /= undefined end, RR) of
-        true ->
-            RR;
-        false ->
-            undefined
-    end;
-validate_ts_records(_) ->
-    undefined.
-
-validate_ts_query(Q) when is_binary(Q) ->
-    binary_to_list(Q);
-validate_ts_query(_) ->
-    undefined.
-
 
 -spec check_permissions(#wm_reqdata{}, #ctx{}) -> ?CB_RV_SPEC.
 %% We have to defer checking permission until we have figured which
@@ -465,14 +359,9 @@ api_call_to_ts_perm(get) ->
 api_call_to_ts_perm(put) ->
     "riak_ts.put";
 api_call_to_ts_perm(delete) ->
-    "riak_ts.delete";
-api_call_to_ts_perm(coverage) ->
-    "riak_ts.coverage".
+    "riak_ts.delete".
 
 -spec validate_resource(#wm_reqdata{}, #ctx{}) -> ?CB_RV_SPEC.
-validate_resource(RD, Ctx = #ctx{api_call = coverage}) ->
-    %% there is always a resource for coverage
-    {false, RD, Ctx};
 validate_resource(RD, Ctx = #ctx{table = Table}) ->
     %% Ensure the bucket type exists, otherwise 404 early.
     case riak_kv_wm_utils:bucket_type_exists(Table) of
@@ -544,9 +433,7 @@ call_api_function(RD, Ctx = #ctx{api_call = put,
     Mod = riak_ql_ddl:make_module_name(Table),
     %% convert records to tuples, just for put
     Records = [list_to_tuple(R) || R <- Data],
-    case catch riak_kv_ts_util:validate_rows(Mod, Records) of
-        {_, {undef, _}} ->
-            handle_error({no_such_table, Table}, RD, Ctx);
+    try riak_kv_ts_util:validate_rows(Mod, Records) of
         [] ->
             case riak_kv_ts_util:put_data(Records, Table, Mod) of
                 ok ->
@@ -558,6 +445,11 @@ call_api_function(RD, Ctx = #ctx{api_call = put,
             end;
         BadRowIdxs when is_list(BadRowIdxs) ->
             handle_error({invalid_data, BadRowIdxs}, RD, Ctx)
+    catch
+        %% @todo: this should not happen, we have already validate that Mod
+        %% exists when we validated the request.
+        error:{undef, _} ->
+            handle_error({no_such_tabse, Table}, RD, Ctx)
     end;
 
 call_api_function(RD, Ctx0 = #ctx{api_call = get,
@@ -568,9 +460,7 @@ call_api_function(RD, Ctx0 = #ctx{api_call = get,
            true -> [{timeout, Timeout}]
         end,
     Mod = riak_ql_ddl:make_module_name(Table),
-    case catch riak_kv_ts_util:get_data(Key, Table, Mod, Options) of
-        {_, {undef, _}} ->
-            handle_error({no_such_table, Table}, RD, Ctx0);
+    try riak_kv_ts_util:get_data(Key, Table, Mod, Options) of
         {ok, Record} ->
             {ColumnNames, Row} = lists:unzip(Record),
             %% ColumnTypes = riak_kv_ts_util:get_column_types(ColumnNames, Mod),
@@ -587,6 +477,11 @@ call_api_function(RD, Ctx0 = #ctx{api_call = get,
             handle_error({key_element_count_mismatch, Got, Need}, RD, Ctx0);
         {error, Reason} ->
             handle_error({riak_error, Reason}, RD, Ctx0)
+    catch
+        %% @todo: this should not happen, we have already validate that Mod
+        %% exists when we validated the request.
+        error:{undef, _} ->
+            handle_error({no_such_table, Table}, RD, Ctx0)
     end;
 
 call_api_function(RD, Ctx = #ctx{api_call = delete,
@@ -597,9 +492,7 @@ call_api_function(RD, Ctx = #ctx{api_call = delete,
            true -> [{timeout, Timeout}]
         end,
     Mod = riak_ql_ddl:make_module_name(Table),
-    case catch riak_kv_ts_util:delete_data(Key, Table, Mod, Options) of
-        {_, {undef, _}} ->
-            handle_error({no_such_table, Table}, RD, Ctx);
+    try riak_kv_ts_util:delete_data(Key, Table, Mod, Options) of
         ok ->
             prepare_data_in_body(RD, Ctx#ctx{result = ok});
         {error, {bad_key_length, Got, Need}} ->
@@ -608,51 +501,13 @@ call_api_function(RD, Ctx = #ctx{api_call = delete,
             handle_error(notfound, RD, Ctx);
         {error, Reason} ->
             handle_error({riak_error, Reason}, RD, Ctx)
-    end;
-
-call_api_function(RD, Ctx = #ctx{api_call = coverage,
-                                 query = Query,
-                                 client = Client}) ->
-    Lexed = riak_ql_lexer:get_tokens(Query),
-    case riak_ql_parser:parse(Lexed) of
-        {ok, SQL = ?SQL_SELECT{'FROM' = Table}} ->
-            Mod = riak_ql_ddl:make_module_name(Table),
-            case riak_kv_ts_util:compile_to_per_quantum_queries(Mod, SQL) of
-                {ok, Compiled} ->
-                    Bucket = riak_kv_ts_util:table_to_bucket(Table),
-                    Results =
-                        [begin
-                             Node = proplists:get_value(node, Cover),
-                             {IP, Port} = riak_kv_pb_coverage:node_to_pb_details(Node),
-                             {entry,
-                              [
-                               {cover_context,
-                                riak_kv_pb_coverage:term_to_checksum_binary({Cover, Range})},
-                               {ip, IP},
-                               {port, Port},
-                               {range,
-                                [
-                                 {field_name, FieldName},
-                                 {lower_bound, StartVal},
-                                 {lower_bound_inclusive, StartIncl},
-                                 {upper_bound, EndVal},
-                                 {upper_bound_inclusive, EndIncl},
-                                 {desc, SQLtext}
-                                ]}
-                              ]}
-                         end || {Cover,
-                                 Range = {FieldName, {{StartVal, StartIncl}, {EndVal, EndIncl}}},
-                                 SQLtext}
-                                    <- riak_kv_ts_util:sql_to_cover(Client, Compiled, Bucket, [])],
-                    prepare_data_in_body(RD, Ctx#ctx{result = Results});
-                {error, _Reason} ->
-                    handle_error(query_compile_fail, RD, Ctx)
-            end;
-        {ok, _NonSelectQuery} ->
-            handle_error(inappropriate_sql_for_coverage, RD, Ctx);
-        {error, Reason} ->
-            handle_error({query_parse_error, Reason}, RD, Ctx)
+    catch
+        %% @todo: this should not happen, we have already validate that Mod
+        %% exists when we validated the request.
+        error:{undef, _} ->
+            handle_error({no_such_table, Table}, RD, Ctx)
     end.
+
 
 
 prepare_data_in_body(RD0, Ctx0) ->
@@ -668,23 +523,8 @@ produce_doc_body(RD, Ctx = #ctx{api_call = get,
     {mochijson2:encode(
        {struct, [{<<"columns">>, Columns},
                  {<<"rows">>, Rows}]}),
-     RD, Ctx};
-produce_doc_body(RD, Ctx = #ctx{api_call = coverage,
-                                result = CoverageDetails}) ->
-    SafeCoverageDetails =
-        [{entry, armor_entry(E)} || {entry, E} <- CoverageDetails],
-    {mochijson2:encode(
-       {struct, [{<<"coverage">>, SafeCoverageDetails}]}),
      RD, Ctx}.
 
-armor_entry(EE) ->
-    lists:map(
-      fun({cover_context, Bin}) ->
-              %% prevent list to be read and converted by mochijson2
-              %% as utf8 binary
-              {cover_context, binary_to_list(Bin)};
-         (X) -> X
-      end, EE).
 
 
 error_out(Type, Fmt, Args, RD, Ctx) ->
@@ -742,9 +582,6 @@ handle_error(Error, RD, Ctx) ->
         {query_parse_error, Detailed} ->
             error_out({halt, 400},
                       "Malformed query: ~ts", [Detailed], RD, Ctx);
-        inappropriate_sql_for_coverage ->
-            error_out({halt, 400},
-                      "Inappropriate query for coverage request", [], RD, Ctx);
         query_compile_fail ->
             error_out({halt, 400},
                       "Failed to compile query for coverage request", [], RD, Ctx)
