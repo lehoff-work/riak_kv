@@ -165,34 +165,43 @@ ts_keys_to_body(EncodedKeys, Table, Mod) ->
     BaseUrl = base_url(Table),
     Keys = decode_keys(EncodedKeys),
     KeyTypes = riak_kv_wm_ts_util:local_key_fields_and_types(Mod),
-    URLs = [format_url(BaseUrl, KeyTypes, Key)
-            || Key <- Keys],
-    %% Dialyzer does not like the list_comprehension, if you want to avoid the
-    %% dialyzer error you have to write it like this:
-    %% URLs = lists:map(fun(Key) ->
-    %%                          format_url(BaseUrl, KeyTypes, Key)
-    %%                  end,
-    %%                  Keys),
-    list_to_binary(lists:flatten(URLs)).
+    %% Dialyzer issues this warning if the lists:map is replaced with
+    %% the list comprehension (below):
+    %%   riak_kv_wm_timeseries_listkeys.erl:168: The pattern [Key | _] can never match the type []
+    %% for which no clear workaround could be found.
+    %%
+    %% URLs = [format_url(BaseUrl, KeyTypes, Key)
+    %%         || Key <- Keys],
+
+    URLs = lists:map(fun(Key) ->
+                             format_url(BaseUrl, KeyTypes, Key)
+                     end,
+                     Keys),
+    iolist_to_binary(URLs).
 
 
 format_url(BaseUrl, KeyTypes, Key) ->
-    list_to_binary(
-      io_lib:format("~s~s~n", [BaseUrl, key_to_string(Key, KeyTypes)])).
+    iolist_to_binary([BaseUrl, key_to_string(lists:zip(Key, KeyTypes)), $\n]).
 
 decode_keys(Keys) ->
     [tuple_to_list(sext:decode(A))
      || A <- Keys, A /= []].
 
-key_to_string([], []) ->
-    "";
-key_to_string([Key|Keys], [{Field, Type}|KeyTypes]) ->
-    Field ++ "/" ++ value_to_url_string(Key, Type) ++ "/" ++ key_to_string(Keys, KeyTypes).
+key_to_string(KFTypes) ->
+    string:join(
+      [[Field, $/, mochiweb_util:quote_plus(value_to_url_string(Key, Type))]
+       || {Key, {Field, Type}} <- KFTypes],
+      "/").
 
 value_to_url_string(V, varchar) ->
     binary_to_list(V);
+value_to_url_string(V, sint64) ->
+    integer_to_list(V);
+value_to_url_string(V, double) ->
+    %% float_to_list(V);  %% this would give "1.19999999999999995559e+00" for 1.2
+    lists:flatten(io_lib:format("~g", [V]));
 value_to_url_string(V, timestamp) ->
-    erlang:integer_to_list(V).
+    integer_to_list(V).
 
 base_url(Table) ->
     {ok, [{Server, Port}]} = application:get_env(riak_api, http),
