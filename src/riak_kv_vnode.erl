@@ -1530,7 +1530,7 @@ prepare_read_before_write_put(#state{mod = Mod,
         not_found ->
             prepare_put_new_object(State, PutArgs, IndexBackend);
         {ok, OldObj} ->
-            prepare_put_existing_object(State, PutArgs, OldObj, IndexBackend, CacheData, RequiresGet)
+            prepare_put_existing_object(State, PutArgs, OldObj, IndexBackend, CacheData, RequiresGet, IsSearchable)
     end.
 
 prepare_put_existing_object(#state{idx =Idx} = State,
@@ -1541,7 +1541,7 @@ prepare_put_existing_object(#state{idx =Idx} = State,
                              bprops = BProps,
                              prunetime=PruneTime,
                              crdt_op = CRDTOp}=PutArgs,
-                            OldObj, IndexBackend, CacheData, RequiresGet) ->
+                            OldObj, IndexBackend, CacheData, RequiresGet, IsSearchable) ->
     {ActorId, State2} = maybe_new_key_epoch(Coord, State, OldObj, RObj),
     case put_merge(Coord, LWW, OldObj, RObj, ActorId, StartTime) of
         {oldobj, OldObj} ->
@@ -1551,15 +1551,14 @@ prepare_put_existing_object(#state{idx =Idx} = State,
             IndexSpecs = get_index_specs(IndexBackend, CacheData, RequiresGet, AMObj, OldObj),
             ObjToStore0 = maybe_prune_vclock(PruneTime, AMObj, BProps),
             ObjectToStore = maybe_do_crdt_update(Coord, CRDTOp, ActorId, ObjToStore0),
-            %% maybe_clean_search_siblings(BProps, OldObj),
+            maybe_clean_search_siblings(IsSearchable, OldObj, Idx),
             determine_put_result(ObjectToStore, Idx, PutArgs, State2, IndexSpecs, IndexBackend)
     end.
 
-%%maybe_clean_search_siblings(BProps, _OldObj) ->
-%%    case ?IS_SEARCH_ENABLED_FOR_BUCKET(BProps) of
-%%        true -> ok; %% clean_index_siblings(OldObj);
-%%        _ -> ok
-%%    end.
+maybe_clean_search_siblings(_IsSearchable=true, OldObj, Idx) ->
+    ?INDEX(OldObj, sibling_delete, Idx);
+maybe_clean_search_siblings(_IsSearchable=false, _OldObj, _Idx) ->
+    ok.
 
 determine_put_result({error, E}, Idx, PutArgs, State, _IndexSpecs, _IndexBackend) ->
     {{fail, Idx, E}, PutArgs, State};
