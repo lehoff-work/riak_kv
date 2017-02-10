@@ -27,7 +27,7 @@
 prop_redirect() ->
     ?SETUP( fun setup/0,
             ?FORALL(Cmds, 
-                    with_parameter(process, worker, commands(?MODULE)),
+                    commands(?MODULE),
                     begin
                         start(),
                         {H, S, Res} = run_commands(?MODULE,Cmds),
@@ -77,7 +77,19 @@ api_spec() ->
                       functions = [ #api_fun{ name = get_bucket, arity = 1} ]},
                    #api_module{
                       name = riak_kv_put_fsm_comm,
-                      functions = [ #api_fun{ name = start_state, arity = 0} ]}
+                      functions = [ #api_fun{ name = start_state, arity = 0} ]},
+                   #api_module{
+                      name = riak_core_node_watcher, 
+                      functions = [ #api_fun{ name = nodes, arity=1}
+                                                % returns : 
+                                                % -type preflist_ann() :: [{{index(),
+                                                % node()}, primary|fallback}].
+                                  ]},
+                   #api_module{
+                      name = riak_core_apl,
+                      functions = [ #api_fun{ name = get_apl_ann, arity=3},
+                                    #api_fun{ name = get_primary_apl, arity=3}
+                                  ]}
                   ]}.
                                               
 
@@ -98,6 +110,9 @@ start_put_args(_S) ->
 start_put_pre(S) ->
     S#state.fsm_pid == not_started.
 
+
+%% @todo: mock riak_kv_get_put_monitor and avoid the parallelism with the
+%% KV_STAT_CALLOUT that it causes.
 start_put_callouts(_S, _Args) ->
     ?SEQ([?APP_HELPER_CALLOUT([riak_kv, put_coordinator_failure_timeout, 3000])
          ,?APP_HELPER_CALLOUT([riak_kv, fsm_trace_enabled])
@@ -115,6 +130,14 @@ start_put_next(S, Pid, _Args) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_prepare(Pid) ->
     gen_fsm:send_event(Pid, start).
+
+%% Do this in a worker process so that the previous step has collected all callouts
+%% before we begin.
+%% In a newer EQC/OTP combo it would be safe to use 
+%%  with_parameter(default_process, worker, commands(?MODULE))
+%% in the ?FORALL.
+start_prepare_process(_,_) ->
+    worker.
 
 start_prepare_args(S) ->
     [S#state.fsm_pid].
@@ -163,3 +186,5 @@ app_get_env(riak_core, default_bucket_props) ->
 
 app_get_env(riak_kv, put_coordinator_failure_timeout, 3000) ->
     3000.
+
+
