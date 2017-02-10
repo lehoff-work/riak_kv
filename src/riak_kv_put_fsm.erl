@@ -245,7 +245,7 @@ test_link(From, Object, PutOptions, StateProps) ->
 init([From, RObj, Options0, Monitor]) ->
     BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
     CoordTimeout = get_put_coordinator_failure_timeout(),
-    Trace = application:get_env(riak_kv, fsm_trace_enabled),
+    Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
     Options = proplists:unfold(Options0),
     BadCoordinators = get_option(bad_coordinators, Options, []),
     StateData = #state{from = From,
@@ -272,7 +272,7 @@ init([From, RObj, Options0, Monitor]) ->
         _ ->
             ok
     end,
-    gen_fsm:send_event(self(), timeout),
+    riak_kv_put_fsm_comm:start_state(),
     {ok, prepare, StateData};
 init({test, Args, StateProps}) ->
     %% Call normal init
@@ -297,14 +297,14 @@ maybe_spawn_put_monitor(false) ->
     ok.
 
 %% @private
-prepare(timeout, StateData0 = #state{from = From, robj = RObj,
+prepare(start, StateData0 = #state{from = From, robj = RObj,
                                      bkey = BKey = {Bucket, _Key},
                                      options = Options,
                                      trace = Trace,
                                      bad_coordinators = BadCoordinators}) ->
     maybe_send_ack(Options),
-    {ok, DefaultProps} = application:get_env(riak_core, 
-                                             default_bucket_props),
+    DefaultProps = app_helper:get_env(riak_core,
+                                      default_bucket_props),
     BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
     %% typed buckets never fall back to defaults
     Props = 
@@ -422,12 +422,13 @@ maybe_send_ack(Options) ->
     end.
 
 %% @private
-validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
-                                      options = Options0,
-                                      robj = RObj0,
-                                      n=N, bucket_props = BucketProps,
-                                      trace = Trace,
-                                      preflist2 = Preflist2}) ->
+validate(start_state,
+         StateData0 = #state{from = {raw, ReqId, _Pid},
+                             options = Options0,
+                             robj = RObj0,
+                             n=N, bucket_props = BucketProps,
+                             trace = Trace,
+                             preflist2 = Preflist2}) ->
     Timeout = get_option(timeout, Options0, ?DEFAULT_TIMEOUT),
     PW0 = get_option(pw, Options0, default),
     W0 = get_option(w, Options0, default),
@@ -781,7 +782,7 @@ new_state(StateName, StateData) ->
 %% Move to the new state, marking the time it started and trigger an immediate
 %% timeout.
 new_state_timeout(StateName, StateData=#state{trace = true}) ->
-    gen_fsm:send_event(self(), timeout),
+    riak_kv_put_fsm_comm:start_state(),
     {next_state, StateName, add_timing(StateName, StateData)};
 new_state_timeout(StateName, StateData) ->
     gen_fsm:send_event(self(), timeout),
