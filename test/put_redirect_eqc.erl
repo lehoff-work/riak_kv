@@ -26,11 +26,13 @@
 
 prop_redirect() ->
     ?SETUP( fun setup/0,
-            ?FORALL(Cmds, commands(?MODULE),
+            ?FORALL(Cmds, 
+                    with_parameter(process, worker, commands(?MODULE)),
                     begin
                         start(),
                         {H, S, Res} = run_commands(?MODULE,Cmds),
                         stop(S),
+                        io:format("mock trace: ~p~n", [eqc_mocking:get_trace(api_spec())]),
                         pretty_commands(?MODULE, Cmds, {H, S, Res},
                                         aggregate(command_names(Cmds),
                                                   Res == ok))
@@ -100,8 +102,7 @@ start_put_callouts(_S, _Args) ->
     ?SEQ([?APP_HELPER_CALLOUT([riak_kv, put_coordinator_failure_timeout, 3000])
          ,?APP_HELPER_CALLOUT([riak_kv, fsm_trace_enabled])
          ,?PAR([?KV_STAT_CALLOUT
-               ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [], ok)])
-         ]).
+               ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [], ok)])]).   
 
 start_put_post(_S, _Args, Pid) ->
     is_pid(Pid) andalso erlang:is_process_alive(Pid).
@@ -113,7 +114,6 @@ start_put_next(S, Pid, _Args) ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_prepare(Pid) ->
-    timer:sleep(50),
     gen_fsm:send_event(Pid, start).
 
 start_prepare_args(S) ->
@@ -123,10 +123,12 @@ start_prepare_pre(S) ->
     S#state.next_state==prepare.
 
 start_prepare_callouts(_S, _Args) ->
-   ?SEQ([?APP_HELPER_CALLOUT([riak_core, default_bucket_props])
+    ?SEQ([
+          ?APP_HELPER_CALLOUT([riak_core, default_bucket_props])
          ,?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
                    app_get_env(riak_core, default_bucket_props))
-         ]).
+      ]).
+        
 
 start_prepare_next(S, _, _Args) ->
     S#state{next_state = waiting_local_vnode}.
