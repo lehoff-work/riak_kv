@@ -272,7 +272,7 @@ init([From, RObj, Options0, Monitor]) ->
         _ ->
             ok
     end,
-    riak_kv_put_fsm_comm:start_state(),
+    riak_kv_put_fsm_comm:start_state(prepare),
     {ok, prepare, StateData};
 init({test, Args, StateProps}) ->
     %% Call normal init
@@ -297,7 +297,7 @@ maybe_spawn_put_monitor(false) ->
     ok.
 
 %% @private
-prepare(start, StateData0 = #state{from = From, robj = RObj,
+prepare({start,prepare}, StateData0 = #state{from = From, robj = RObj,
                                      bkey = BKey = {Bucket, _Key},
                                      options = Options,
                                      trace = Trace,
@@ -356,8 +356,7 @@ prepare(start, StateData0 = #state{from = From, robj = RObj,
                 {_, true} ->
                     %% This node is not in the preference list
                     %% forward on to a random node
-                    {ListPos, _} = random:uniform_s(length(Preflist2), os:timestamp()),
-                    {{_Idx, CoordNode},_Type} = lists:nth(ListPos, Preflist2),
+                    {{_Idx, CoordNode},_Type} = riak_kv_util:get_random_element(Preflist2),
                     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
                             ["prepare", atom2list(CoordNode)]),
                     try
@@ -402,7 +401,7 @@ prepare(start, StateData0 = #state{from = From, robj = RObj,
                                                 tracked_bucket = StatTracked},
                     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
                             ["prepare", CoordPlNode]),
-                    new_state_timeout(validate, StateData)
+                    start_next_state(validate, StateData)
             end
     end.
 
@@ -422,7 +421,7 @@ maybe_send_ack(Options) ->
     end.
 
 %% @private
-validate(start_state,
+validate({start, validate},
          StateData0 = #state{from = {raw, ReqId, _Pid},
                              options = Options0,
                              robj = RObj0,
@@ -516,7 +515,7 @@ validate(start_state,
                 [] -> % Nothing to run, spare the timing code
                     execute(StateData);
                 _ ->
-                    new_state_timeout(precommit, StateData)
+                    start_next_state(precommit, StateData)
             end
     end.
 
@@ -532,25 +531,35 @@ apply_updates(RObj0, Options) ->
     
 
 %% Run the precommit hooks
-precommit(timeout, State = #state{precommit = []}) ->
-    execute(State);
-precommit(timeout, State = #state{precommit = [Hook | Rest], 
-                                  robj = RObj,
-                                  trace = Trace}) ->
+precommit({start, precommit}, State) ->
+    case process_precommits(State) of
+        {ok, NewState} ->
+            execute(NewState);
+        {{error, _Reason}=Error, NewState} ->
+            process_reply(Error, NewState)
+    end.
+
+process_precommits(#state{precommit = []}=State) ->
+    {ok, State};
+process_precommits(#state{precommit = [Hook | Rest],
+                          robj = RObj,
+                          trace = Trace} = State) ->
     Result = decode_precommit(invoke_hook(Hook, RObj), Trace),
     case Result of
         fail ->
             ?DTRACE(Trace, ?C_PUT_FSM_PRECOMMIT, [-1], []),
-            process_reply({error, precommit_fail}, State);
+            {{error, precommit_fail}, State};
         {fail, Reason} ->
-            ?DTRACE(Trace, ?C_PUT_FSM_PRECOMMIT, [-1], 
+            ?DTRACE(Trace, ?C_PUT_FSM_PRECOMMIT, [-1],
                     [dtrace_errstr(Reason)]),
-            process_reply({error, {precommit_fail, Reason}}, State);
+            {{error, {precommit_fail, Reason}}, State};
         Result ->
             ?DTRACE(Trace, ?C_PUT_FSM_PRECOMMIT, [0], []),
-            {next_state, precommit, State#state{robj = riak_object:apply_updates(Result),
-                                                precommit = Rest}, 0}
+            process_precommits(State#state{robj = riak_object:apply_updates(Result),
+                                           precommit = Rest})
     end.
+
+
 
 %% @private
 execute(State=#state{coord_pl_entry = CPL}) ->
@@ -676,7 +685,7 @@ waiting_remote_vnode(Result, StateData = #state{putcore = PutCore,
 %% @private
 postcommit(timeout, StateData = #state{postcommit = [], trace = Trace}) ->
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [0], []),
-    new_state_timeout(finish, StateData);
+    start_next_state(finish, StateData);
 postcommit(timeout, StateData = #state{postcommit = [Hook | Rest],
                                        trace = Trace,
                                        putcore = PutCore}) ->
@@ -779,13 +788,13 @@ new_state(StateName, StateData=#state{trace = true}) ->
 new_state(StateName, StateData) ->
     {next_state, StateName, StateData}.
 
-%% Move to the new state, marking the time it started and trigger an immediate
-%% timeout.
-new_state_timeout(StateName, StateData=#state{trace = true}) ->
-    riak_kv_put_fsm_comm:start_state(),
+%% Move to the new state, marking the time it started and trigger the event
+%% that causes the state to start.
+start_next_state(StateName, StateData= #state{trace = true}) ->
+    riak_kv_put_fsm_comm:start_state(StateName),
     {next_state, StateName, add_timing(StateName, StateData)};
-new_state_timeout(StateName, StateData) ->
-    gen_fsm:send_event(self(), timeout),
+start_next_state(StateName, StateData) ->
+    riak_kv_put_fsm_comm:start_state(StateName),
     {next_state, StateName, StateData}.
 
 %% What to do once enough responses from vnodes have been received to reply
@@ -808,7 +817,7 @@ process_reply(Reply, StateData = #state{postcommit = PostCommit,
     case Reply of
         ok ->
             ?DTRACE(Trace, ?C_PUT_FSM_PROCESS_REPLY, [0], []),
-            new_state_timeout(postcommit, StateData2);
+            start_next_state(postcommit, StateData2);
         {ok, _} ->
             Values = riak_object:get_values(RObj),
             %% TODO: more accurate sizing method
@@ -822,10 +831,10 @@ process_reply(Reply, StateData = #state{postcommit = PostCommit,
                 _ ->
                     ok
             end,
-            new_state_timeout(postcommit, StateData2);
+            start_next_state(postcommit, StateData2);
         _ ->
             ?DTRACE(Trace, ?C_PUT_FSM_PROCESS_REPLY, [-1], []),
-            new_state_timeout(finish, StateData2)
+            start_next_state(finish, StateData2)
     end.
 
 
@@ -1035,10 +1044,9 @@ get_option(Name, Options, Default) ->
             Default
     end.
 
-schedule_timeout(infinity) ->
-    undefined;
+
 schedule_timeout(Timeout) ->
-    erlang:send_after(Timeout, self(), request_timeout).
+    riak_kv_put_fsm_comm:schedule_request_timeout(Timeout).
 
 client_reply(Reply, State = #state{from = {raw, ReqId, Pid},
                                    timing = Timing0,
