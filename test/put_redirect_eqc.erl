@@ -112,7 +112,8 @@ api_spec() ->
                    #api_module{
                       name = riak_kv_put_fsm_comm,
                       functions = [ #api_fun{ name = start_state, arity = 1},
-                                    #api_fun{ name = schedule_request_timeout, arity=1}
+                                    #api_fun{ name = schedule_request_timeout, arity=1},
+                                    #api_fun{ name = start_remote_coordinator, arity=2}
                                   ]},
                    #api_module{
                       name = riak_core_node_watcher, 

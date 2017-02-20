@@ -112,7 +112,9 @@
                 trace = false :: boolean(), 
                 tracked_bucket=false :: boolean(), %% track per bucket stats
                 bad_coordinators = [] :: [atom()],
-                coordinator_timeout :: integer()
+                coordinator_timeout :: integer(),
+                middleman :: pid(),
+                coordinating_node :: node()
                }).
 
 -include("riak_kv_dtrace.hrl").
@@ -197,26 +199,14 @@ determine_skip_coordinator_retry(_NotCapable=false, _DoNotRetrySetting=false, _R
 determine_skip_coordinator_retry(_NotCapable, _DoNotRetrySetting, _RetryDisabledViaOptions) ->
     true.
 
-spawn_coordinator_proc(CoordNode, Mod, Fun, Args) ->
-    %% If the net_kernel cannot talk to CoordNode, then any variation
-    %% of the spawn BIF will block.  The whole point of picking a new
-    %% coordinator node is being able to pick a new coordinator node
-    %% and try it ... without blocking for dozens of seconds.
-    spawn(fun() ->
-                  proc_lib:spawn(CoordNode, Mod, Fun, Args)
-          end).
 
-monitor_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, StateData) ->
+%% @doc Note that the state waiting_remote_coordinator only expects messages sent to it using erlang:send/2.
+%%      So there is no implementation of event handling for that state.
+maybe_await_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, StateData) ->
     {stop, normal, StateData};
-monitor_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, StateData) ->
-    receive
-        {ack, CoordNode, now_executing} ->
-            {stop, normal, StateData}
-    after StateData#state.coordinator_timeout ->
-            exit(MiddleMan, kill),
-            Bad = StateData#state.bad_coordinators,
-            prepare(timeout, StateData#state{bad_coordinators=[CoordNode|Bad]})
-    end.
+maybe_await_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, StateData) ->
+    {next_state, waiting_remote_coordinator, StateData#state{middleman = MiddleMan,
+                                                             coordinating_node = CoordNode}}.
 
 %% ===================================================================
 %% Test API
@@ -367,14 +357,13 @@ prepare({start,prepare}, StateData0 = #state{from = From, robj = RObj,
                     try
                         {UseAckP, Options2} = make_ack_options(Options),
                         Options3 = [{bad_coordinators, BadCoordinators} | Options2],
-                        MiddleMan = spawn_coordinator_proc(
-                                      CoordNode, riak_kv_put_fsm, start_link,
-                                      [From,RObj,Options3]),
+                        MiddleMan = riak_kv_put_fsm_comm:start_remote_coordinator(
+                                      CoordNode, [From,RObj,Options3], StateData0#state.coordinator_timeout),
                         ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
                                 ["prepare", atom2list(CoordNode)]),
                         ok = riak_kv_stat:update(coord_redir),
-                        monitor_remote_coordinator(UseAckP, MiddleMan,
-                                                   CoordNode, StateData0)
+                        maybe_await_remote_coordinator(UseAckP, MiddleMan,
+                                                       CoordNode, StateData0)
                     catch
                         _:Reason ->
                             ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
@@ -784,7 +773,18 @@ handle_sync_event(_Event, _From, _StateName, StateData) ->
 
 handle_info(request_timeout, StateName, StateData) ->
     ?MODULE:StateName(request_timeout, StateData);
-handle_info({ack, Node, now_executing}, StateName, StateData) ->
+handle_info({ack, CoordNode, now_executing}, waiting_remote_coordinator,
+            #state{coordinating_node = CoordNode} = StateData) ->
+    {stop, normal, StateData};
+handle_info(coordinator_timeout, waiting_remote_coordinator, StateData) ->
+    exit(StateData#state.middleman, kill),
+    NewBad = [StateData#state.coordinating_node | StateData#state.bad_coordinators],
+    riak_kv_put_fsm_comm:start_state(prepare),
+    {next_state, prepare, StateData#state{bad_coordinators = NewBad}};
+handle_info(coordinator_timeout, StateName, StateData) ->
+    % @todo: might want to store and kill the TRef for this timeout as a cleaner way of doing it.
+    {next_state, StateName, StateData};
+handle_info({ack, Node, now_executing}, StateName, #state{coordinating_node = Node} = StateData) ->
     late_put_fsm_coordinator_ack(Node),
     ok = riak_kv_stat:update(late_put_fsm_coordinator_ack),
     {next_state, StateName, StateData};
