@@ -243,40 +243,12 @@ test_link(From, Object, PutOptions, StateProps) ->
 
 %% @private
 init([From, RObj, Options0, Monitor]) ->
-    BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
-    CoordTimeout = get_put_coordinator_failure_timeout(),
-    Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
-    Options = proplists:unfold(Options0),
-    BadCoordinators = get_option(bad_coordinators, Options, []),
-    StateData = #state{from = From,
-                       robj = RObj,
-                       bkey = BKey,
-                       trace = Trace,
-                       options = Options,
-                       bad_coordinators = BadCoordinators,
-                       timing = riak_kv_fsm_timing:add_timing(prepare, []),
-                       coordinator_timeout=CoordTimeout},
-    maybe_spawn_put_monitor(Monitor),
-    case Trace of
-        true ->
-            riak_core_dtrace:put_tag([Bucket, $,, Key]),
-            case riak_kv_util:is_x_deleted(RObj) of
-                true  ->
-                    TombNum = 1,
-                    TombStr = <<"tombstone">>;
-                false ->
-                    TombNum = 0,
-                    TombStr = <<>>
-            end,
-            ?DTRACE(?C_PUT_FSM_INIT, [TombNum], ["init", TombStr]);
-        _ ->
-            ok
-    end,
+    StateData = init_statedata(From, RObj, Options0, Monitor),
     riak_kv_put_fsm_comm:start_state(prepare),
     {ok, prepare, StateData};
 init({test, Args, StateProps}) ->
-    %% Call normal init
-    {ok, prepare, StateData} = init(Args),
+    %% go through the normal init
+    StateData= erlang:apply(fun init_statedata/4, Args),
 
     %% Then tweak the state record with entries provided by StateProps
     Fields = record_info(fields, state),
@@ -289,7 +261,40 @@ init({test, Args, StateProps}) ->
 
     %% Enter into the validate state, skipping any code that relies on the
     %% state of the rest of the system
+    riak_kv_put_fsm_comm:start_state(validate),
     {ok, validate, TestStateData}.
+
+init_statedata(From, RObj, Options0, Monitor) ->
+    BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
+    CoordTimeout = get_put_coordinator_failure_timeout(),
+    Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
+    Options = proplists:unfold(Options0),
+    BadCoordinators = get_option(bad_coordinators, Options, []),
+    StateData = #state{from                = From,
+                       robj                = RObj,
+                       bkey                = BKey,
+                       trace               = Trace,
+                       options             = Options,
+                       bad_coordinators    = BadCoordinators,
+                       timing              = riak_kv_fsm_timing:add_timing(prepare, []),
+                       coordinator_timeout = CoordTimeout},
+    maybe_spawn_put_monitor(Monitor),
+    case Trace of
+        true ->
+            riak_core_dtrace:put_tag([Bucket, $,, Key]),
+            case riak_kv_util:is_x_deleted(RObj) of
+                true ->
+                    TombNum = 1,
+                    TombStr = <<"tombstone">>;
+                false ->
+                    TombNum = 0,
+                    TombStr = <<>>
+            end,
+            ?DTRACE(?C_PUT_FSM_INIT, [TombNum], ["init", TombStr]);
+        _ ->
+            ok
+    end,
+    StateData.
 
 maybe_spawn_put_monitor(true) ->
     riak_kv_get_put_monitor:put_fsm_spawned(self());
@@ -683,24 +688,15 @@ waiting_remote_vnode(Result, StateData = #state{putcore = PutCore,
     end.
 
 %% @private
-postcommit(timeout, StateData = #state{postcommit = [], trace = Trace}) ->
-    ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [0], []),
-    start_next_state(finish, StateData);
-postcommit(timeout, StateData = #state{postcommit = [Hook | Rest],
-                                       trace = Trace,
-                                       putcore = PutCore}) ->
-    ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [-2], []),
-    %% Process the next hook - gives sys:get_status messages a chance if hooks
-    %% take a long time.
-    {ReplyObj, UpdPutCore} =  riak_kv_put_core:final(PutCore),
-    decode_postcommit(invoke_hook(Hook, ReplyObj), Trace),
-    {next_state, postcommit, StateData#state{postcommit = Rest,
-                                             trace = Trace,
-                                             putcore = UpdPutCore}, 0};
-%% still process hooks even if request timed out  
+
+postcommit({start, postcommit}, StateData) ->
+    maybe_process_postcommit(StateData);
+postcommit(next_postcommit_hook, StateData) ->
+    maybe_process_postcommit(StateData);
+%% still process hooks even if request timed out
 postcommit(request_timeout, StateData = #state{trace = Trace}) -> 
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [-3], []),
-    {next_state, postcommit, StateData, 0};
+    {next_state, postcommit, StateData};
 postcommit(Reply, StateData = #state{putcore = PutCore,
                                      trace = Trace}) ->
     case Trace of
@@ -713,9 +709,33 @@ postcommit(Reply, StateData = #state{putcore = PutCore,
     end,
     %% late responses - add to state.  *Does not* recompute finalobj
     UpdPutCore = riak_kv_put_core:add_result(Reply, PutCore),
-    {next_state, postcommit, StateData#state{putcore = UpdPutCore}, 0}.
+    {next_state, postcommit, StateData#state{putcore = UpdPutCore}}.
 
-finish(timeout, StateData = #state{timing = Timing, reply = Reply,
+maybe_process_postcommit(StateData) ->
+    case process_postcommit_hook(StateData) of
+        done ->
+            start_next_state(finish, StateData);
+        {more, NewStateData} ->
+            % this provides room for sys:get_status to be served if a hook takes a
+            % long time to execute
+            gen_fsm:send_event(self(), next_postcommit_hook),
+            {next_state, postcommit, NewStateData}
+    end.
+
+process_postcommit_hook(#state{postcommit = [], trace = Trace}) ->
+    ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [0], []),
+    done;
+process_postcommit_hook(StateData = #state{postcommit = [Hook | Rest],
+                                           trace      = Trace,
+                                           putcore    = PutCore}) ->
+    ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [-2], []),
+    {ReplyObj, UpdPutCore} =  riak_kv_put_core:final(PutCore),
+    decode_postcommit(invoke_hook(Hook, ReplyObj), Trace),
+    {more, StateData#state{postcommit = Rest,
+                           putcore = UpdPutCore}}.
+
+
+finish({start, finish}, StateData = #state{timing = Timing, reply = Reply,
                                    bkey = {Bucket, _Key},
                                    trace = Trace,
                                    tracked_bucket = StatTracked,
@@ -749,7 +769,7 @@ finish(Reply, StateData = #state{putcore = PutCore,
     end,
     %% late responses - add to state.  *Does not* recompute finalobj
     UpdPutCore = riak_kv_put_core:add_result(Reply, PutCore),
-    {next_state, finish, StateData#state{putcore = UpdPutCore}, 0}.
+    {next_state, finish, StateData#state{putcore = UpdPutCore}}.
 
 
 %% @private
