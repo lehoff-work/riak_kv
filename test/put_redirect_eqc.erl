@@ -10,7 +10,9 @@
 
 -record(state, 
         { fsm_pid = not_started,
-          next_state = not_started
+          next_state = not_started,
+          nodes,
+          bad_coordinators
         }).
 
 
@@ -23,6 +25,9 @@
 -define(APP_HELPER_CALLOUT(Args), 
         ?CALLOUT(app_helper, get_env, Args,
                  erlang:apply(?MODULE, app_get_env, Args))).
+
+-define(LAGER_ERROR,
+        ?CALLOUT(lager, error, [?WILDCARD, ?WILDCARD], ok)).
 
 -define(KV_STAT_CALLOUT,
         ?CALLOUT(riak_kv_stat, update, [?WILDCARD], ok)).
@@ -113,7 +118,7 @@ api_spec() ->
                       name = riak_kv_put_fsm_comm,
                       functions = [ #api_fun{ name = start_state, arity = 1},
                                     #api_fun{ name = schedule_request_timeout, arity=1},
-                                    #api_fun{ name = start_remote_coordinator, arity=2}
+                                    #api_fun{ name = start_remote_coordinator, arity=3}
                                   ]},
                    #api_module{
                       name = riak_core_node_watcher, 
@@ -128,12 +133,20 @@ api_spec() ->
                                     #api_fun{ name = get_primary_apl, arity=3}
                                   ]},
                    #api_module{
+                      name = riak_core_capability,
+                      functions = [ #api_fun{ name = get, arity=2} 
+                                  ]},
+                   #api_module{
                       name = riak_kv_hooks,
                       functions = [ #api_fun{ name = get_conditional_postcommit, arity=2}
                                   ]},
                    #api_module{
                       name = riak_kv_util_mock,
                       functions = [ #api_fun{ name = get_random_element, arity=1}
+                                  ]},
+                   #api_module{
+                      name = lager,
+                      functions = [ #api_fun{ name = error, arity=2 } 
                                   ]}
                   ]}.
                                               
@@ -143,14 +156,14 @@ api_spec() ->
 %%%% Commands
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-start_put(From, Object, PutOptions) ->
+start_put(From, Object, PutOptions, _Nodes) ->
     {ok, Pid} = riak_kv_put_fsm:start_link(From, Object, PutOptions),
     unlink(Pid),
     Pid.
 
 
 start_put_args(_S) ->
-    [from(), new_object(), put_options()].
+    [from(), new_object(), put_options(), riak_nodes()].
 
 start_put_pre(S) ->
     S#state.fsm_pid == not_started.
@@ -167,9 +180,11 @@ start_put_callouts(_S, _Args) ->
 start_put_post(_S, _Args, Pid) ->
     is_pid(Pid) andalso erlang:is_process_alive(Pid).
 
-start_put_next(S, Pid, _Args) ->
+start_put_next(S, Pid, [_From, _Object, PutOptions, Nodes]) ->
     S#state{fsm_pid = Pid,
-            next_state = prepare}.
+            next_state = prepare,
+            nodes = Nodes,
+            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions)}.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -190,28 +205,49 @@ start_prepare_args(S) ->
 start_prepare_pre(S) ->
     S#state.next_state==prepare.
 
-start_prepare_callouts(_S, _Args) ->
+start_prepare_callouts(S, _Args) ->
     NVal = 3, % @todo: get this from state
-    ?SEQ([
-          ?APP_HELPER_CALLOUT([riak_core, default_bucket_props])
-         ,?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
-                   app_get_env(riak_core, default_bucket_props))
-         ,?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
-                   upnodes())
-         ,?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, NVal, ?WILDCARD],
-                   active_preflist(sloppy_quorum, upnodes())) % @todo: need some bad nodes at some point 
-         ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [validate], ok)
-%         ,?CALLOUT(riak_kv_hooks, get_conditional_postcommit, [?WILDCARD, ?WILDCARD],
-%                   [])
-          %% ,?CALLOUT(riak_kv_util, get_random_element, [?WILDCARD], 
-          %%           pick_coordinating_node()) % @todo: must depend on the apl
-
-      ]).
-        
+    APL = active_preflist(sloppy_quorum, S, NVal),
+    InitalSequence = 
+        ?SEQ([
+              ?APP_HELPER_CALLOUT([riak_core, default_bucket_props])
+             ,?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
+                       (app_get_env(riak_core, default_bucket_props)))
+             ,?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
+                       (S#state.nodes))
+             ,?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, NVal, ?WILDCARD],
+                       APL)
+              ]),
+    % @todo: take into account if we use
+    % sloppy_quorum (true is default)
+    BranchSequence = 
+        case should_node_coordinate(S) of
+            true ->
+                io:format("*"),
+                ?SEQ([
+                      ?CALLOUT(riak_kv_put_fsm_comm, start_state, [validate], ok)
+                     ]);
+            false ->
+                io:format("R"),
+                ?SEQ([
+                      ?CALLOUT(riak_kv_util_mock, get_random_element, [?WILDCARD], 
+                               lists:last(APL))
+                     ,?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled)
+                     ,?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true])
+                     ,?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
+                               [node_c, ?WILDCARD, ?WILDCARD], some_pid)
+                     ,?KV_STAT_CALLOUT
+                     ])
+        end,
+    ?SEQ(InitalSequence, BranchSequence).
 
 start_prepare_next(S, _, _Args) ->
-    S#state{next_state = validate}.
-
+    case should_node_coordinate(S) of
+        true -> 
+            S#state{next_state = done}; % should be validate if we want to test more
+        false ->
+            S#state{next_state = done}
+    end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_validate(Pid) ->
@@ -268,8 +304,15 @@ new_object() ->
 put_options() ->
     [{n_val, 3}, 
      {w, quorum}, 
-     {chash_keyfun, {riak_core_util, chash_std_keyfun}}].
-
+     {chash_keyfun, {riak_core_util, chash_std_keyfun}},
+     {sloppy_quorum, true},
+     {bad_coordinators, bad_coordinators()}].
+       
+bad_coordinators() ->
+    elements([
+            [],
+            [node_c]
+           ]).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%% Mocking functions
@@ -284,22 +327,34 @@ app_get_env(riak_core, default_bucket_props) ->
 
 
 app_get_env(riak_kv, put_coordinator_failure_timeout, 3000) ->
-    3000.
+    3000;
+app_get_env(riak_kv, retry_put_coordinator_failure, true) ->
+    true.
 
 
-upnodes() ->
-    [node(), node_b, node_c, node_d, node_e].
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Helper functions
 
-active_preflist(sloppy_quorum, UpNodes) ->
-    [{{0, N}, node_type(N)} || N <- UpNodes].
+riak_nodes() ->
+    [node_a, node_b, node_c, node()].
 
-node_type(N) when N == node_d orelse N==node_e -> 
+preflist(Nodes, NVal) ->
+    lists:sublist(Nodes, NVal).
+
+is_node_primary(Nodes) ->
+    lists:member(node(), lists:sublist(Nodes, 3)).
+
+should_node_coordinate(S) ->
+    is_node_primary(S#state.nodes -- S#state.bad_coordinators).
+
+active_preflist(sloppy_quorum, S, NVal) ->
+    All = [{{0, N}, node_type(N)} || N <- (S#state.nodes -- S#state.bad_coordinators)],
+    lists:sublist(All, NVal).
+
+node_type(N) when N == node() -> 
     fallback;
 node_type(_) -> 
     primary.
-
-pick_coordinating_node() ->
-    node_b.
 
 
 request_timeout(infinity) ->
