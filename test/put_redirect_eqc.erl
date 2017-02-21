@@ -12,7 +12,8 @@
         { fsm_pid = not_started,
           next_state = not_started,
           nodes,
-          bad_coordinators
+          bad_coordinators,
+          coordinating_node = none
         }).
 
 
@@ -206,8 +207,9 @@ start_prepare_pre(S) ->
     S#state.next_state==prepare.
 
 start_prepare_callouts(S, _Args) ->
+    io:format("#"),
     NVal = 3, % @todo: get this from state
-    APL = active_preflist(sloppy_quorum, S, NVal),
+    {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S, NVal),
     InitalSequence = 
         ?SEQ([
               ?APP_HELPER_CALLOUT([riak_core, default_bucket_props])
@@ -228,26 +230,82 @@ start_prepare_callouts(S, _Args) ->
                       ?CALLOUT(riak_kv_put_fsm_comm, start_state, [validate], ok)
                      ]);
             false ->
-                io:format("R"),
+                io:format(">"),
+
                 ?SEQ([
                       ?CALLOUT(riak_kv_util_mock, get_random_element, [?WILDCARD], 
-                               lists:last(APL))
+                               APLChoice)
                      ,?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled)
                      ,?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true])
                      ,?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
-                               [node_c, ?WILDCARD, ?WILDCARD], some_pid)
-                     ,?KV_STAT_CALLOUT
+                               [CoordinatingNode, ?WILDCARD, ?WILDCARD], fake_fsm)
+                %     ,?KV_STAT_CALLOUT
                      ])
         end,
     ?SEQ(InitalSequence, BranchSequence).
 
+%% need to have a real process around so that the put FSM can kill it when the
+%% coordinator_timeout happens.
+fake_fsm() ->
+    spawn( fun fake_loop/0 ).
+
+fake_loop() ->
+    receive
+        _M ->
+            fake_loop()
+    end.
+
+calc_apl_arguments(S, NVal) ->
+    APL = active_preflist(sloppy_quorum, S, NVal),
+    APLChoice = lists:last(APL),
+    {{_, CoordinatingNode}, _} = APLChoice,
+    {APL, APLChoice, CoordinatingNode}.
+
 start_prepare_next(S, _, _Args) ->
     case should_node_coordinate(S) of
         true -> 
+            io:format("C"),
             S#state{next_state = done}; % should be validate if we want to test more
         false ->
-            S#state{next_state = done}
+            io:format("NoC"),
+            {_, _, CoordinatingNode} = calc_apl_arguments(S, 3),
+            S#state{next_state = waiting_remote_coordinator,
+                    coordinating_node = CoordinatingNode}
     end.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+waiting_remote_coordinator(Pid, {executing_ack, Node}) ->
+    Pid ! {ack, Node, now_executing};
+waiting_remote_coordinator(Pid, coordinator_timeout) ->
+    Pid ! coordinator_timeout.
+
+waiting_remote_coordinator_process(_,_) ->
+    worker.
+
+waiting_remote_coordinator_args(S) ->
+    io:format("W"),
+    elements([
+              [S#state.fsm_pid, {executing_ack, S#state.coordinating_node}],
+              [S#state.fsm_pid, coordinator_timeout]
+             ]).
+
+waiting_remote_coordinator_pre(S) ->
+    S#state.next_state == waiting_remote_coordinator.
+
+waiting_remote_coordinator_callouts(_S, [_FsmPid, {executing_ack, _}]) ->
+    ?CALLOUT(riak_kv_stat, update, [{fsm_exit, puts}], ok);
+waiting_remote_coordinator_callouts(_S, [_FsmPid, coordinator_timeout]) ->
+    ?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok).
+                 
+
+waiting_remote_coordinator_next(S, _, [_FsmPid, {executing_ack, _}]) ->
+    S#state{next_state = done};
+waiting_remote_coordinator_next(S, _, [_FsmPid, coordinator_timeout]) ->
+    S#state{next_state = prepare,
+            bad_coordinators = [S#state.coordinating_node | 
+                                S#state.bad_coordinators]}.
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_validate(Pid) ->
@@ -262,7 +320,7 @@ start_validate_args(S) ->
 start_validate_pre(S) ->
     S#state.next_state == validate.
 
-start_validate_callouts(_S, _Angs) ->
+start_validate_callouts(_S, _Args) ->
     ?SEQ([?CALLOUT(riak_kv_hooks, get_conditional_postcommit, [?WILDCARD, ?WILDCARD],
                    [])
          ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [precommit], ok)
@@ -310,8 +368,8 @@ put_options() ->
        
 bad_coordinators() ->
     elements([
-            [],
-            [node_c]
+            []
+%            [node_c]
            ]).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -337,6 +395,10 @@ app_get_env(riak_kv, retry_put_coordinator_failure, true) ->
 
 riak_nodes() ->
     [node_a, node_b, node_c, node()].
+    %% elements([
+    %%           [node_a, node_b, node_c, node()],
+    %%           [node_a, node_b, node_c, node_d, node()]
+    %%          ]).
 
 preflist(Nodes, NVal) ->
     lists:sublist(Nodes, NVal).
@@ -345,16 +407,21 @@ is_node_primary(Nodes) ->
     lists:member(node(), lists:sublist(Nodes, 3)).
 
 should_node_coordinate(S) ->
+    io:format("~p -- ~p~n", [S#state.nodes, S#state.bad_coordinators]),
     is_node_primary(S#state.nodes -- S#state.bad_coordinators).
 
 active_preflist(sloppy_quorum, S, NVal) ->
     All = [{{0, N}, node_type(N)} || N <- (S#state.nodes -- S#state.bad_coordinators)],
     lists:sublist(All, NVal).
 
-node_type(N) when N == node() -> 
-    fallback;
-node_type(_) -> 
-    primary.
+node_type(node_a) ->
+    primary;
+node_type(node_b) ->
+    primary;
+node_type(node_c) ->
+    primary;
+node_type(_N) ->
+    fallback.
 
 
 request_timeout(infinity) ->

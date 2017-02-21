@@ -779,7 +779,7 @@ handle_info({ack, CoordNode, now_executing}, waiting_remote_coordinator,
 handle_info(coordinator_timeout, waiting_remote_coordinator, StateData) ->
     exit(StateData#state.middleman, kill),
     NewBad = [StateData#state.coordinating_node | StateData#state.bad_coordinators],
-    riak_kv_put_fsm_comm:start_state(prepare),
+    riak_kv_put_fsm_comm:start_state(prepare_rebar),
     {next_state, prepare, StateData#state{bad_coordinators = NewBad}};
 handle_info(coordinator_timeout, StateName, StateData) ->
     % @todo: might want to store and kill the TRef for this timeout as a cleaner way of doing it.
