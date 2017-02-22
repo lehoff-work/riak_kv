@@ -9,11 +9,12 @@
 -include_lib("eqc/include/eqc_component.hrl").
 
 -record(state, 
-        { fsm_pid = not_started,
+        { fsm_pid,
           next_state = not_started,
           nodes,
           bad_coordinators,
-          coordinating_node = none
+          coordinating_node = none,
+          fake_fsm
         }).
 
 
@@ -91,11 +92,12 @@ start() ->
     ok.
 
 stop(S) ->
-    catch exit(S#state.fsm_pid, kill).
+    catch exit(S#state.fsm_pid, kill),
+    catch exit(S#state.fake_fsm, kill).
 
 
 initial_state() ->
-    #state{}.
+    #state{fake_fsm = fake_fsm()}.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -156,6 +158,7 @@ api_spec() ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%% Commands
 
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_put(From, Object, PutOptions, _Nodes) ->
     {ok, Pid} = riak_kv_put_fsm:start_link(From, Object, PutOptions),
@@ -167,7 +170,7 @@ start_put_args(_S) ->
     [from(), new_object(), put_options(), riak_nodes()].
 
 start_put_pre(S) ->
-    S#state.fsm_pid == not_started.
+    S#state.next_state == not_started.
 
 
 %% @todo: mock riak_kv_get_put_monitor and avoid the parallelism with the
@@ -179,18 +182,21 @@ start_put_callouts(_S, _Args) ->
                ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok)])]).   
 
 start_put_post(_S, _Args, Pid) ->
-    is_pid(Pid) andalso erlang:is_process_alive(Pid).
+    check_pid(Pid).
+
 
 start_put_next(S, Pid, [_From, _Object, PutOptions, Nodes]) ->
     S#state{fsm_pid = Pid,
             next_state = prepare,
             nodes = Nodes,
-            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions)}.
+            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions)
+           }.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_prepare(Pid) ->
     gen_fsm:send_event(Pid, {start, prepare}).
+
 
 %% Do this in a worker process so that the previous step has collected all callouts
 %% before we begin.
@@ -238,8 +244,8 @@ start_prepare_callouts(S, _Args) ->
                      ,?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled)
                      ,?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true])
                      ,?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
-                               [CoordinatingNode, ?WILDCARD, ?WILDCARD], fake_fsm)
-                %     ,?KV_STAT_CALLOUT
+                               [CoordinatingNode, ?WILDCARD, ?WILDCARD], S#state.fake_fsm)
+                     ,?KV_STAT_CALLOUT
                      ])
         end,
     ?SEQ(InitalSequence, BranchSequence).
@@ -261,13 +267,13 @@ calc_apl_arguments(S, NVal) ->
     {{_, CoordinatingNode}, _} = APLChoice,
     {APL, APLChoice, CoordinatingNode}.
 
-start_prepare_next(S, _, _Args) ->
+start_prepare_next(S, _FakeFsmPid, _Args) ->
     case should_node_coordinate(S) of
         true -> 
-            io:format("C"),
+            io:format("+"),
             S#state{next_state = done}; % should be validate if we want to test more
         false ->
-            io:format("NoC"),
+            io:format("-"),
             {_, _, CoordinatingNode} = calc_apl_arguments(S, 3),
             S#state{next_state = waiting_remote_coordinator,
                     coordinating_node = CoordinatingNode}
@@ -368,9 +374,9 @@ put_options() ->
        
 bad_coordinators() ->
     elements([
-            []
-%            [node_c]
-           ]).
+              [],
+              [node_c]
+             ]).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%% Mocking functions
@@ -394,11 +400,11 @@ app_get_env(riak_kv, retry_put_coordinator_failure, true) ->
 %% Helper functions
 
 riak_nodes() ->
-    [node_a, node_b, node_c, node()].
-    %% elements([
-    %%           [node_a, node_b, node_c, node()],
-    %%           [node_a, node_b, node_c, node_d, node()]
-    %%          ]).
+%%    [node_a, node_b, node_c, node()].
+    elements([
+              [node_a, node_b, node_c, node()],
+              [node_a, node_b, node_c, node_d, node()]
+             ]).
 
 preflist(Nodes, NVal) ->
     lists:sublist(Nodes, NVal).
@@ -407,7 +413,7 @@ is_node_primary(Nodes) ->
     lists:member(node(), lists:sublist(Nodes, 3)).
 
 should_node_coordinate(S) ->
-    io:format("~p -- ~p~n", [S#state.nodes, S#state.bad_coordinators]),
+%    io:format("~p -- ~p~n", [S#state.nodes, S#state.bad_coordinators]),
     is_node_primary(S#state.nodes -- S#state.bad_coordinators).
 
 active_preflist(sloppy_quorum, S, NVal) ->
@@ -429,3 +435,5 @@ request_timeout(infinity) ->
 request_timeout(_Timeout) ->
     ?CALLOUT(riak_kv_put_fsm_comm, schedule_request_timeout, [?WILDCARD], reqquest_timeout_ref).
 
+check_pid(Pid) -> 
+    is_pid(Pid) andalso erlang:is_process_alive(Pid).
