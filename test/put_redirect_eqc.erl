@@ -16,6 +16,7 @@
           bad_coordinators,
           coordinating_node = none,
           fake_fsm,
+          coordinator_tref,
           coordinator_has_timed_out = false
         }).
 
@@ -99,7 +100,8 @@ stop(S) ->
 
 
 initial_state() ->
-    #state{fake_fsm = fake_fsm()}.
+    #state{fake_fsm = fake_fsm(),
+           coordinator_tref = make_ref()}.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -239,9 +241,10 @@ start_prepare_callouts(S, _Args) ->
                      APLChoice),
             ?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled),
             ?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true]),
-            ?MATCH({Options, _SomePid},
+            ?MATCH({Options, _},
                    ?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
-                            [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], S#state.fake_fsm)),
+                            [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], 
+                            {S#state.fake_fsm, S#state.coordinator_tref})),
             ?ASSERT(?MODULE, correct_options, [Options, S]),
             ?KV_STAT_CALLOUT
     end.
@@ -290,8 +293,8 @@ start_prepare_next(S, _FakeFsmPid, _Args) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 waiting_remote_coordinator(Pid, {executing_ack, Node}) ->
     Pid ! {ack, Node, now_executing};
-waiting_remote_coordinator(Pid, coordinator_timeout) ->
-    Pid ! coordinator_timeout.
+waiting_remote_coordinator(Pid, {coordinator_timeout, TRef}) ->
+    Pid ! {timeout, TRef, coordinator_timeout}.
 
 waiting_remote_coordinator_process(_,_) ->
     worker.
@@ -300,7 +303,7 @@ waiting_remote_coordinator_args(S) ->
     io:format("W"),
     elements([
               [S#state.fsm_pid, {executing_ack, S#state.coordinating_node}],
-              [S#state.fsm_pid, coordinator_timeout]
+              [S#state.fsm_pid, {coordinator_timeout, S#state.coordinator_tref}]
              ]).
 
 waiting_remote_coordinator_pre(S) ->
@@ -308,7 +311,7 @@ waiting_remote_coordinator_pre(S) ->
 
 waiting_remote_coordinator_callouts(_S, [_FsmPid, {executing_ack, _}]) ->
     ?CALLOUT(riak_kv_stat, update, [{fsm_exit, puts}], ok);
-waiting_remote_coordinator_callouts(_S, [_FsmPid, coordinator_timeout]) ->
+waiting_remote_coordinator_callouts(_S, [_FsmPid, {coordinator_timeout, _}]) ->
     ?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok).
                  
 
@@ -319,12 +322,12 @@ waiting_remote_coordinator_features(S, _Args, {ack, _, _}) ->
         true ->
             [remote_executes_after_timeout]
     end;
-waiting_remote_coordinator_features(_S, _Args, coordinator_timeout) ->
+waiting_remote_coordinator_features(_S, _Args, {timeout, _, coordinator_timeout}) ->
     [remote_timeout].
 
 waiting_remote_coordinator_next(S, _Res, [_FsmPid, {executing_ack, _}]) ->
     S#state{next_state = done};
-waiting_remote_coordinator_next(S, _Res, [_FsmPid, coordinator_timeout]) ->
+waiting_remote_coordinator_next(S, _Res, [_FsmPid, {coordinator_timeout, _}]) ->
     S#state{next_state = prepare,
             bad_coordinators = [S#state.coordinating_node | 
                                 S#state.bad_coordinators],

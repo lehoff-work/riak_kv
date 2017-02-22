@@ -22,5 +22,5 @@ start_remote_coordinator(CoordNode, Args, CoordinatorTimeout) ->
     Pid = spawn(fun() ->
                     proc_lib:spawn(CoordNode, riak_kv_put_fsm, start_link, Args)
                 end),
-    erlang:send_after(CoordinatorTimeout, self(), coordinator_timeout),
-    Pid.
+    TRef = erlang:start_timer(CoordinatorTimeout, self(), coordinator_timeout),
+    {Pid, TRef}.
