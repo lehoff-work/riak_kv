@@ -14,7 +14,8 @@
           nodes,
           bad_coordinators,
           coordinating_node = none,
-          fake_fsm
+          fake_fsm,
+          coordinator_has_timed_out = false
         }).
 
 
@@ -49,7 +50,7 @@ prop_redirect() ->
                         stop(S),
                         % io:format("mock trace: ~p~n", [eqc_mocking:get_trace(api_spec())]),
                         pretty_commands(?MODULE, Cmds, {H, S, Res},
-                                        aggregate(command_names(Cmds),
+                                        aggregate(call_features(H),
                                                   Res == ok))
                     end)).
 
@@ -248,7 +249,6 @@ start_prepare_callouts(S, _Args) ->
 correct_options(Options, S) ->
     Expected = lists:usort(S#state.bad_coordinators),
     Sent = lists:usort(proplists:get_value(bad_coordinators, Options, [])),
-    io:format("~p == ~p~n", [Expected, Sent]),
     Expected == Sent.
                        
 
@@ -259,6 +259,19 @@ calc_apl_arguments(S, NVal) ->
     APLChoice = lists:last(APL),
     {{_, CoordinatingNode}, _} = APLChoice,
     {APL, APLChoice, CoordinatingNode}.
+
+
+start_prepare_features(S, _Args, _) ->
+    case {should_node_coordinate(S), S#state.coordinator_has_timed_out} of
+        {true, true} ->
+            [coordinate_after_timeout];
+        {true, false} ->
+            [coordinate];
+        {false, true} ->
+            [redirect_after_timeout];
+        {false, false} ->
+            [redirect]
+    end.
 
 start_prepare_next(S, _FakeFsmPid, _Args) ->
     case should_node_coordinate(S) of
@@ -298,12 +311,23 @@ waiting_remote_coordinator_callouts(_S, [_FsmPid, coordinator_timeout]) ->
     ?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok).
                  
 
-waiting_remote_coordinator_next(S, _, [_FsmPid, {executing_ack, _}]) ->
+waiting_remote_coordinator_features(S, _Args, {ack, _, _}) ->
+    case S#state.coordinator_has_timed_out of 
+        false -> 
+            [remote_executes];
+        true ->
+            [remote_executes_after_timeout]
+    end;
+waiting_remote_coordinator_features(_S, _Args, coordinator_timeout) ->
+    [remote_timeout].
+
+waiting_remote_coordinator_next(S, _Res, [_FsmPid, {executing_ack, _}]) ->
     S#state{next_state = done};
-waiting_remote_coordinator_next(S, _, [_FsmPid, coordinator_timeout]) ->
+waiting_remote_coordinator_next(S, _Res, [_FsmPid, coordinator_timeout]) ->
     S#state{next_state = prepare,
             bad_coordinators = [S#state.coordinating_node | 
-                                S#state.bad_coordinators]}.
+                                S#state.bad_coordinators],
+            coordinator_has_timed_out = true}.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -406,7 +430,6 @@ is_node_primary(Nodes) ->
     lists:member(node(), lists:sublist(Nodes, 3)).
 
 should_node_coordinate(S) ->
-%    io:format("~p -- ~p~n", [S#state.nodes, S#state.bad_coordinators]),
     is_node_primary(S#state.nodes -- S#state.bad_coordinators).
 
 active_preflist(sloppy_quorum, S, NVal) ->
