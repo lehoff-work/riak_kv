@@ -254,7 +254,7 @@ init({test, Args, StateProps}) ->
 init_statedata(From, RObj, Options0, Monitor) ->
     BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
     CoordTimeout = get_put_coordinator_failure_timeout(),
-    Trace = application:get_env(riak_kv, fsm_trace_enabled),
+    Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
     Options = proplists:unfold(Options0),
     StateData = #state{from                = From,
                        robj                = RObj,
@@ -287,8 +287,8 @@ prepare({start, prepare}, StateData0 = #state{from = From, robj = RObj,
                                      options = Options,
                                      trace = Trace,
                                      bad_coordinators = BadCoordinators}) ->
-    {ok, DefaultProps} = application:get_env(riak_core, 
-                                             default_bucket_props),
+    DefaultProps = app_helper:get_env(riak_core,
+                                       default_bucket_props),
     BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
     %% typed buckets never fall back to defaults
     Props = 
@@ -340,8 +340,7 @@ prepare({start, prepare}, StateData0 = #state{from = From, robj = RObj,
                 {_, true} ->
                     %% This node is not in the preference list
                     %% forward on to a random node
-                    {ListPos, _} = random:uniform_s(length(Preflist2), os:timestamp()),
-                    {{_Idx, CoordNode},_Type} = lists:nth(ListPos, Preflist2),
+                    {{_Idx, CoordNode},_Type} =riak_kv_util:get_random_element(Preflist2),
                     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
                             ["prepare", atom2list(CoordNode)]),
                     try
