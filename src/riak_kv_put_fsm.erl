@@ -47,6 +47,8 @@
          waiting_remote_vnode/2,
          postcommit/2, finish/2]).
 
+-export([executing_ack/1]).
+
 -type detail_info() :: timing.
 -type detail() :: true |
                   false |
@@ -110,7 +112,10 @@
                 trace = false :: boolean(), 
                 tracked_bucket=false :: boolean(), %% track per bucket stats
                 bad_coordinators = [] :: [atom()],
-                coordinator_timeout :: integer()
+                coordinator_timeout :: integer(),
+                middleman :: pid(),
+                coordinating_node :: node(),
+                coordinator_tref :: reference()
                }).
 
 -include("riak_kv_dtrace.hrl").
@@ -185,26 +190,21 @@ make_ack_options(Options) ->
             end
     end.
 
-spawn_coordinator_proc(CoordNode, Mod, Fun, Args) ->
-    %% If the net_kernel cannot talk to CoordNode, then any variation
-    %% of the spawn BIF will block.  The whole point of picking a new
-    %% coordinator node is being able to pick a new coordinator node
-    %% and try it ... without blocking for dozens of seconds.
-    spawn(fun() ->
-                  proc_lib:spawn(CoordNode, Mod, Fun, Args)
-          end).
+%% Called locally to let the remote Pid know that we are now executing and the remote Pid may stop running.
+executing_ack(Pid) ->
+    Pid ! {ack, node(), now_executing}.
 
-monitor_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, StateData) ->
+
+
+%% @doc Note that the state waiting_remote_coordinator only expects messages sent to it using erlang:send/2.
+%%      So there is no implementation of event handling for that state.
+maybe_await_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, CoordinatorTRef, StateData) ->
+    erlang:cancel_timer(CoordinatorTRef),
     {stop, normal, StateData};
-monitor_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, StateData) ->
-    receive
-        {ack, CoordNode, now_executing} ->
-            {stop, normal, StateData}
-    after StateData#state.coordinator_timeout ->
-            exit(MiddleMan, kill),
-            Bad = StateData#state.bad_coordinators,
-            prepare(timeout, StateData#state{bad_coordinators=[CoordNode|Bad]})
-    end.
+maybe_await_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, CoordinatorTRef, StateData) ->
+    new_state(waiting_remote_coordinator, StateData#state{middleman = MiddleMan,
+                                                          coordinating_node = CoordNode,
+                                                          coordinator_tref = CoordinatorTRef}).
 
 %% ===================================================================
 %% Test API
@@ -231,38 +231,12 @@ test_link(From, Object, PutOptions, StateProps) ->
 
 %% @private
 init([From, RObj, Options0, Monitor]) ->
-    BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
-    CoordTimeout = get_put_coordinator_failure_timeout(),
-    Trace = application:get_env(riak_kv, fsm_trace_enabled),
-    Options = proplists:unfold(Options0),
-    StateData = #state{from = From,
-                       robj = RObj,
-                       bkey = BKey,
-                       trace = Trace,
-                       options = Options,
-                       timing = riak_kv_fsm_timing:add_timing(prepare, []),
-                       coordinator_timeout=CoordTimeout},
-    (Monitor =:= true) andalso riak_kv_get_put_monitor:put_fsm_spawned(self()),
-    case Trace of
-        true ->
-            riak_core_dtrace:put_tag([Bucket, $,, Key]),
-            case riak_kv_util:is_x_deleted(RObj) of
-                true  ->
-                    TombNum = 1,
-                    TombStr = <<"tombstone">>;
-                false ->
-                    TombNum = 0,
-                    TombStr = <<>>
-            end,
-            ?DTRACE(?C_PUT_FSM_INIT, [TombNum], ["init", TombStr]);
-        _ ->
-            ok
-    end,
-    gen_fsm:send_event(self(), timeout),
+    StateData = init_statedata(From, RObj, Options0, Monitor),
+    riak_kv_put_fsm_comm:start_state(prepare),
     {ok, prepare, StateData};
 init({test, Args, StateProps}) ->
-    %% Call normal init
-    {ok, prepare, StateData} = init(Args),
+    %% go through the normal init
+    StateData= erlang:apply(fun init_statedata/4, Args),
 
     %% Then tweak the state record with entries provided by StateProps
     Fields = record_info(fields, state),
@@ -277,8 +251,38 @@ init({test, Args, StateProps}) ->
     %% state of the rest of the system
     {ok, validate, TestStateData}.
 
+init_statedata(From, RObj, Options0, Monitor) ->
+    BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
+    CoordTimeout = get_put_coordinator_failure_timeout(),
+    Trace = application:get_env(riak_kv, fsm_trace_enabled),
+    Options = proplists:unfold(Options0),
+    StateData = #state{from                = From,
+                       robj                = RObj,
+                       bkey                = BKey,
+                       trace               = Trace,
+                       options             = Options,
+                       timing              = riak_kv_fsm_timing:add_timing(prepare, []),
+                       coordinator_timeout = CoordTimeout},
+    (Monitor =:= true) andalso riak_kv_get_put_monitor:put_fsm_spawned(self()),
+    case Trace of
+        true ->
+            riak_core_dtrace:put_tag([Bucket, $,, Key]),
+            case riak_kv_util:is_x_deleted(RObj) of
+                true ->
+                    TombNum = 1,
+                    TombStr = <<"tombstone">>;
+                false ->
+                    TombNum = 0,
+                    TombStr = <<>>
+            end,
+            ?DTRACE(?C_PUT_FSM_INIT, [TombNum], ["init", TombStr]);
+        _ ->
+            ok
+    end,
+    StateData.
+
 %% @private
-prepare(timeout, StateData0 = #state{from = From, robj = RObj,
+prepare({start, prepare}, StateData0 = #state{from = From, robj = RObj,
                                      bkey = BKey = {Bucket, _Key},
                                      options = Options,
                                      trace = Trace,
@@ -343,14 +347,16 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                     try
                         {UseAckP, Options2} = make_ack_options(
                                                [{ack_execute, self()}|Options]),
-                        MiddleMan = spawn_coordinator_proc(
-                                      CoordNode, riak_kv_put_fsm, start_link,
-                                      [From,RObj,Options2]),
+                        {MiddleMan, CoordinatorTRef} =
+                            riak_kv_put_fsm_comm:start_remote_coordinator(
+                                CoordNode,
+                                [From,RObj,Options2],
+                                StateData0#state.coordinator_timeout),
                         ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
                                 ["prepare", atom2list(CoordNode)]),
                         ok = riak_kv_stat:update(coord_redir),
-                        monitor_remote_coordinator(UseAckP, MiddleMan,
-                                                   CoordNode, StateData0)
+                        maybe_await_remote_coordinator(UseAckP, MiddleMan,
+                                                       CoordNode, CoordinatorTRef, StateData0)
                     catch
                         _:Reason ->
                             ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
@@ -382,12 +388,12 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                                 tracked_bucket = StatTracked},
                     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
                             ["prepare", CoordPlNode]),
-                    new_state_timeout(validate, StateData)
+                    start_new_state(validate, StateData)
             end
     end.
 
 %% @private
-validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
+validate({start, validate}, StateData0 = #state{from = {raw, ReqId, _Pid},
                                       options = Options0,
                                       robj = RObj0,
                                       n=N, bucket_props = BucketProps,
@@ -480,7 +486,7 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
                 [] -> % Nothing to run, spare the timing code
                     execute(StateData);
                 _ ->
-                    new_state_timeout(precommit, StateData)
+                    start_new_state(precommit, StateData)
             end
     end.
 
@@ -496,11 +502,15 @@ apply_updates(RObj0, Options) ->
     
 
 %% Run the precommit hooks
-precommit(timeout, State = #state{precommit = []}) ->
+precommit(Event, State = #state{precommit = []})
+        when Event == {start, precommit};
+             Event == next_precommit ->
     execute(State);
-precommit(timeout, State = #state{precommit = [Hook | Rest], 
+precommit(Event, State = #state{precommit = [Hook | Rest],
                                   robj = RObj,
-                                  trace = Trace}) ->
+                                  trace = Trace})
+    when Event == {start, precommit};
+         Event == next_precommit ->
     Result = decode_precommit(invoke_hook(Hook, RObj), Trace),
     case Result of
         fail ->
@@ -512,8 +522,9 @@ precommit(timeout, State = #state{precommit = [Hook | Rest],
             process_reply({error, {precommit_fail, Reason}}, State);
         Result ->
             ?DTRACE(Trace, ?C_PUT_FSM_PRECOMMIT, [0], []),
+            gen_fsm:send_event(self, next_precommit),
             {next_state, precommit, State#state{robj = riak_object:apply_updates(Result),
-                                                precommit = Rest}, 0}
+                                                precommit = Rest}}
     end.
 
 %% @private
@@ -524,7 +535,7 @@ execute(State=#state{options = Options, coord_pl_entry = CPL}) ->
         undefined ->
             ok;
         Pid ->
-            Pid ! {ack, node(), now_executing}
+            executing_ack(Pid)
     end,
     case CPL of
         undefined ->
@@ -646,24 +657,29 @@ waiting_remote_vnode(Result, StateData = #state{putcore = PutCore,
     end.
 
 %% @private
-postcommit(timeout, StateData = #state{postcommit = [], trace = Trace}) ->
+postcommit(Event, StateData = #state{postcommit = [], trace = Trace})
+    when Event == {start, postcommit};
+         Event == next_poscommit ->
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [0], []),
-    new_state_timeout(finish, StateData);
-postcommit(timeout, StateData = #state{postcommit = [Hook | Rest],
+    start_new_state(finish, StateData);
+postcommit(Event, StateData = #state{postcommit = [Hook | Rest],
                                        trace = Trace,
-                                       putcore = PutCore}) ->
+                                       putcore = PutCore})
+    when Event == {start, postcommit};
+         Event == next_poscommit ->
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [-2], []),
     %% Process the next hook - gives sys:get_status messages a chance if hooks
     %% take a long time.
     {ReplyObj, UpdPutCore} =  riak_kv_put_core:final(PutCore),
     decode_postcommit(invoke_hook(Hook, ReplyObj), Trace),
+    gen_fsm:send_event(self(), next_postcommit),
     {next_state, postcommit, StateData#state{postcommit = Rest,
                                              trace = Trace,
-                                             putcore = UpdPutCore}, 0};
+                                             putcore = UpdPutCore}};
 %% still process hooks even if request timed out  
 postcommit(request_timeout, StateData = #state{trace = Trace}) -> 
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [-3], []),
-    {next_state, postcommit, StateData, 0};
+    {next_state, postcommit, StateData};
 postcommit(Reply, StateData = #state{putcore = PutCore,
                                      trace = Trace}) ->
     case Trace of
@@ -676,9 +692,9 @@ postcommit(Reply, StateData = #state{putcore = PutCore,
     end,
     %% late responses - add to state.  *Does not* recompute finalobj
     UpdPutCore = riak_kv_put_core:add_result(Reply, PutCore),
-    {next_state, postcommit, StateData#state{putcore = UpdPutCore}, 0}.
+    {next_state, postcommit, StateData#state{putcore = UpdPutCore}}.
 
-finish(timeout, StateData = #state{timing = Timing, reply = Reply,
+finish({start, finish}, StateData = #state{timing = Timing, reply = Reply,
                                    bkey = {Bucket, _Key},
                                    trace = Trace,
                                    tracked_bucket = StatTracked,
@@ -712,7 +728,7 @@ finish(Reply, StateData = #state{putcore = PutCore,
     end,
     %% late responses - add to state.  *Does not* recompute finalobj
     UpdPutCore = riak_kv_put_core:add_result(Reply, PutCore),
-    {next_state, finish, StateData#state{putcore = UpdPutCore}, 0}.
+    {next_state, finish, StateData#state{putcore = UpdPutCore}}.
 
 
 %% @private
@@ -727,6 +743,19 @@ handle_sync_event(_Event, _From, _StateName, StateData) ->
 
 handle_info(request_timeout, StateName, StateData) ->
     ?MODULE:StateName(request_timeout, StateData);
+handle_info({ack, CoordNode, now_executing}, waiting_remote_coordinator,
+            #state{coordinating_node = CoordNode} = StateData) ->
+    erlang:cancel_timer(StateData#state.coordinator_tref),
+    {stop, normal, StateData};
+handle_info({timeout, TRef, coordinator_timeout}, waiting_remote_coordinator,
+            #state{coordinator_tref = TRef} = StateData) ->
+    exit(StateData#state.middleman, kill),
+    NewBad = [StateData#state.coordinating_node | StateData#state.bad_coordinators],
+    start_new_state(prepare, StateData#state{bad_coordinators = NewBad,
+                                             coordinator_tref = undefined});
+handle_info({timeout, _TRef, coordinator_timeout}, StateName, StateData) ->
+    % This is a late coordinator_timeout - just ignore.
+    {next_state, StateName, StateData};
 handle_info({ack, Node, now_executing}, StateName, StateData) ->
     late_put_fsm_coordinator_ack(Node),
     ok = riak_kv_stat:update(late_put_fsm_coordinator_ack),
@@ -753,11 +782,11 @@ new_state(StateName, StateData) ->
 
 %% Move to the new state, marking the time it started and trigger an immediate
 %% timeout.
-new_state_timeout(StateName, StateData=#state{trace = true}) ->
-    gen_fsm:send_event(self(), timeout),
+start_new_state(StateName, StateData= #state{trace = true}) ->
+    riak_kv_put_fsm_comm:start_state(StateName),
     {next_state, StateName, add_timing(StateName, StateData)};
-new_state_timeout(StateName, StateData) ->
-    gen_fsm:send_event(self(), timeout),
+start_new_state(StateName, StateData) ->
+    riak_kv_put_fsm_comm:start_state(StateName),
     {next_state, StateName, StateData}.
 
 %% What to do once enough responses from vnodes have been received to reply
@@ -780,7 +809,7 @@ process_reply(Reply, StateData = #state{postcommit = PostCommit,
     case Reply of
         ok ->
             ?DTRACE(Trace, ?C_PUT_FSM_PROCESS_REPLY, [0], []),
-            new_state_timeout(postcommit, StateData2);
+            start_new_state(postcommit, StateData2);
         {ok, _} ->
             Values = riak_object:get_values(RObj),
             %% TODO: more accurate sizing method
@@ -794,10 +823,10 @@ process_reply(Reply, StateData = #state{postcommit = PostCommit,
                 _ ->
                     ok
             end,
-            new_state_timeout(postcommit, StateData2);
+            start_new_state(postcommit, StateData2);
         _ ->
             ?DTRACE(Trace, ?C_PUT_FSM_PROCESS_REPLY, [-1], []),
-            new_state_timeout(finish, StateData2)
+            start_new_state(finish, StateData2)
     end.
 
 
@@ -996,10 +1025,8 @@ get_option(Name, Options, Default) ->
             Default
     end.
 
-schedule_timeout(infinity) ->
-    undefined;
 schedule_timeout(Timeout) ->
-    erlang:send_after(Timeout, self(), request_timeout).
+    riak_kv_put_fsm_comm:schedule_request_timeout(Timeout).
 
 client_reply(Reply, State = #state{from = {raw, ReqId, Pid},
                                    timing = Timing0,
