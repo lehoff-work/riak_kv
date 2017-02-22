@@ -219,6 +219,11 @@ start_prepare_args(S) ->
 start_prepare_pre(S) ->
     S#state.next_state==prepare.
 
+
+%% Note: we use the presence of the correct bad_coordinators in the options used to
+%% start the remote coordinator to determine if this node is sending enough
+%% information to the coordinating node. Otherwise we will see the sibling problem in
+%% https://github.com/basho/riak_kv/issues/1188. 
 start_prepare_callouts(S, _Args) ->
     io:format("#"),
     {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S),
