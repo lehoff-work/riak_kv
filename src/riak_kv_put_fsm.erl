@@ -205,8 +205,8 @@ determine_skip_coordinator_retry(_NotCapable, _DoNotRetrySetting, _RetryDisabled
 maybe_await_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, StateData) ->
     {stop, normal, StateData};
 maybe_await_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, StateData) ->
-    {next_state, waiting_remote_coordinator, StateData#state{middleman = MiddleMan,
-                                                             coordinating_node = CoordNode}}.
+    new_state(waiting_remote_coordinator, StateData#state{middleman = MiddleMan,
+                                                          coordinating_node = CoordNode}).
 
 %% ===================================================================
 %% Test API
@@ -779,8 +779,7 @@ handle_info({ack, CoordNode, now_executing}, waiting_remote_coordinator,
 handle_info(coordinator_timeout, waiting_remote_coordinator, StateData) ->
     exit(StateData#state.middleman, kill),
     NewBad = [StateData#state.coordinating_node | StateData#state.bad_coordinators],
-    riak_kv_put_fsm_comm:start_state(prepare),
-    {next_state, prepare, StateData#state{bad_coordinators = NewBad}};
+    start_next_state(prepare, StateData#state{bad_coordinators = NewBad});
 handle_info(coordinator_timeout, StateName, StateData) ->
     % @todo: might want to store and kill the TRef for this timeout as a cleaner way of doing it.
     {next_state, StateName, StateData};
