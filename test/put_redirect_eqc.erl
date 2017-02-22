@@ -11,6 +11,7 @@
 -record(state, 
         { fsm_pid,
           next_state = not_started,
+          n_val,
           nodes,
           bad_coordinators,
           coordinating_node = none,
@@ -192,7 +193,8 @@ start_put_next(S, Pid, [_From, _Object, PutOptions, Nodes]) ->
     S#state{fsm_pid = Pid,
             next_state = prepare,
             nodes = Nodes,
-            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions)
+            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions),
+            n_val = proplists:get_value(n_val, PutOptions)
            }.
 
 
@@ -217,14 +219,13 @@ start_prepare_pre(S) ->
 
 start_prepare_callouts(S, _Args) ->
     io:format("#"),
-    NVal = 3, % @todo: get this from state
-    {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S, NVal),
+    {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S),
     ?APP_HELPER_CALLOUT([riak_core, default_bucket_props]),
     ?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
              (app_get_env(riak_core, default_bucket_props))),
     ?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
              (S#state.nodes)),
-    ?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, NVal, ?WILDCARD],
+    ?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, ?WILDCARD, ?WILDCARD],
                        APL),
     % @todo: take into account if we use
     % sloppy_quorum (true is default)
@@ -254,8 +255,8 @@ correct_options(Options, S) ->
 
 
 
-calc_apl_arguments(S, NVal) ->
-    APL = active_preflist(sloppy_quorum, S, NVal),
+calc_apl_arguments(S) ->
+    APL = active_preflist(sloppy_quorum, S),
     APLChoice = lists:last(APL),
     {{_, CoordinatingNode}, _} = APLChoice,
     {APL, APLChoice, CoordinatingNode}.
@@ -280,7 +281,7 @@ start_prepare_next(S, _FakeFsmPid, _Args) ->
             S#state{next_state = done}; % should be validate if we want to test more
         false ->
             io:format("-"),
-            {_, _, CoordinatingNode} = calc_apl_arguments(S, 3),
+            {_, _, CoordinatingNode} = calc_apl_arguments(S),
             S#state{next_state = waiting_remote_coordinator,
                     coordinating_node = CoordinatingNode}
     end.
@@ -432,9 +433,9 @@ is_node_primary(Nodes) ->
 should_node_coordinate(S) ->
     is_node_primary(S#state.nodes -- S#state.bad_coordinators).
 
-active_preflist(sloppy_quorum, S, NVal) ->
+active_preflist(sloppy_quorum, S) ->
     All = [{{0, N}, node_type(N)} || N <- (S#state.nodes -- S#state.bad_coordinators)],
-    lists:sublist(All, NVal).
+    lists:sublist(All, S#state.n_val).
 
 node_type(node_a) ->
     primary;
