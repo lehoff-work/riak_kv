@@ -176,10 +176,12 @@ start_put_pre(S) ->
 %% @todo: mock riak_kv_get_put_monitor and avoid the parallelism with the
 %% KV_STAT_CALLOUT that it causes.
 start_put_callouts(_S, _Args) ->
-    ?SEQ([?APP_HELPER_CALLOUT([riak_kv, put_coordinator_failure_timeout, 3000])
-         ,?APP_HELPER_CALLOUT([riak_kv, fsm_trace_enabled])
-         ,?PAR([?KV_STAT_CALLOUT
-               ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok)])]).   
+    ?APP_HELPER_CALLOUT([riak_kv, put_coordinator_failure_timeout, 3000]),
+    ?APP_HELPER_CALLOUT([riak_kv, fsm_trace_enabled]),
+    ?PAR([
+          ?KV_STAT_CALLOUT
+         ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok)]).
+
 
 start_put_post(_S, _Args, Pid) ->
     check_pid(Pid).
@@ -216,50 +218,41 @@ start_prepare_callouts(S, _Args) ->
     io:format("#"),
     NVal = 3, % @todo: get this from state
     {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S, NVal),
-    InitalSequence = 
-        ?SEQ([
-              ?APP_HELPER_CALLOUT([riak_core, default_bucket_props])
-             ,?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
-                       (app_get_env(riak_core, default_bucket_props)))
-             ,?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
-                       (S#state.nodes))
-             ,?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, NVal, ?WILDCARD],
-                       APL)
-              ]),
+    ?APP_HELPER_CALLOUT([riak_core, default_bucket_props]),
+    ?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
+             (app_get_env(riak_core, default_bucket_props))),
+    ?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
+             (S#state.nodes)),
+    ?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, NVal, ?WILDCARD],
+                       APL),
     % @todo: take into account if we use
     % sloppy_quorum (true is default)
-    BranchSequence = 
-        case should_node_coordinate(S) of
-            true ->
-                io:format("*"),
-                ?SEQ([
-                      ?CALLOUT(riak_kv_put_fsm_comm, start_state, [validate], ok)
-                     ]);
-            false ->
-                io:format(">"),
-
-                ?SEQ([
-                      ?CALLOUT(riak_kv_util_mock, get_random_element, [?WILDCARD], 
-                               APLChoice)
-                     ,?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled)
-                     ,?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true])
-                     ,?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
-                               [CoordinatingNode, ?WILDCARD, ?WILDCARD], S#state.fake_fsm)
-                     ,?KV_STAT_CALLOUT
-                     ])
-        end,
-    ?SEQ(InitalSequence, BranchSequence).
-
-%% need to have a real process around so that the put FSM can kill it when the
-%% coordinator_timeout happens.
-fake_fsm() ->
-    spawn( fun fake_loop/0 ).
-
-fake_loop() ->
-    receive
-        _M ->
-            fake_loop()
+    case should_node_coordinate(S) of
+        true ->
+            io:format("*"),
+            ?CALLOUT(riak_kv_put_fsm_comm, start_state, [validate], ok);
+        false ->
+            io:format(">"),
+            ?CALLOUT(riak_kv_util_mock, get_random_element, [?WILDCARD], 
+                     APLChoice),
+            ?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled),
+            ?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true]),
+            ?MATCH({Options, _SomePid},
+                   ?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
+                            [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], S#state.fake_fsm)),
+            ?ASSERT(?MODULE, correct_options, [Options, S]),
+            ?KV_STAT_CALLOUT
     end.
+
+
+correct_options(Options, S) ->
+    Expected = lists:usort(S#state.bad_coordinators),
+    Sent = lists:usort(proplists:get_value(bad_coordinators, Options, [])),
+    io:format("~p == ~p~n", [Expected, Sent]),
+    Expected == Sent.
+                       
+
+
 
 calc_apl_arguments(S, NVal) ->
     APL = active_preflist(sloppy_quorum, S, NVal),
@@ -437,3 +430,15 @@ request_timeout(_Timeout) ->
 
 check_pid(Pid) -> 
     is_pid(Pid) andalso erlang:is_process_alive(Pid).
+
+
+%% need to have a real process around so that the put FSM can kill it when the
+%% coordinator_timeout happens.
+fake_fsm() ->
+    spawn( fun fake_loop/0 ).
+
+fake_loop() ->
+    receive
+        _M ->
+            fake_loop()
+    end.
