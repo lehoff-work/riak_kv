@@ -250,7 +250,9 @@ start_prepare_callouts(S, _Args) ->
                    ?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
                             [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], 
                             {S#state.fake_fsm, S#state.coordinator_tref})),
-            ?ASSERT(?MODULE, correct_options, [Options, S]),
+            ?ASSERT(?MODULE, correct_options, [Options, S], 
+                     {bad_coordinators_in_options, Options,
+                      should_have_mathed, S#state.bad_coordinators}),
             ?KV_STAT_CALLOUT
     end.
 
@@ -258,7 +260,7 @@ start_prepare_callouts(S, _Args) ->
 correct_options(Options, S) ->
     Expected = lists:usort(S#state.bad_coordinators),
     Sent = lists:usort(proplists:get_value(bad_coordinators, Options, [])),
-    Expected == Sent.
+    equals(Expected, Sent).
                        
 
 
