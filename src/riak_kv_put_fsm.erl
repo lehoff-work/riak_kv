@@ -249,6 +249,7 @@ init({test, Args, StateProps}) ->
 
     %% Enter into the validate state, skipping any code that relies on the
     %% state of the rest of the system
+    riak_kv_put_fsm_comm:start_state(validate),
     {ok, validate, TestStateData}.
 
 init_statedata(From, RObj, Options0, Monitor) ->
@@ -521,7 +522,7 @@ precommit(Event, State = #state{precommit = [Hook | Rest],
             process_reply({error, {precommit_fail, Reason}}, State);
         Result ->
             ?DTRACE(Trace, ?C_PUT_FSM_PRECOMMIT, [0], []),
-            gen_fsm:send_event(self, next_precommit),
+            gen_fsm:send_event(self(), next_precommit),
             {next_state, precommit, State#state{robj = riak_object:apply_updates(Result),
                                                 precommit = Rest}}
     end.
@@ -658,14 +659,14 @@ waiting_remote_vnode(Result, StateData = #state{putcore = PutCore,
 %% @private
 postcommit(Event, StateData = #state{postcommit = [], trace = Trace})
     when Event == {start, postcommit};
-         Event == next_poscommit ->
+         Event == next_postcommit ->
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [0], []),
     start_new_state(finish, StateData);
 postcommit(Event, StateData = #state{postcommit = [Hook | Rest],
                                        trace = Trace,
                                        putcore = PutCore})
     when Event == {start, postcommit};
-         Event == next_poscommit ->
+         Event == next_postcommit ->
     ?DTRACE(Trace, ?C_PUT_FSM_POSTCOMMIT, [-2], []),
     %% Process the next hook - gives sys:get_status messages a chance if hooks
     %% take a long time.
