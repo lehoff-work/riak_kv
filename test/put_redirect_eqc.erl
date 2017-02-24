@@ -260,7 +260,7 @@ start_prepare_callouts(S, _Args) ->
 correct_options(Options, S) ->
     Expected = lists:usort(S#state.bad_coordinators),
     Sent = lists:usort(proplists:get_value(bad_coordinators, Options, [])),
-    equals(Expected, Sent).
+    Expected == Sent.
                        
 
 
