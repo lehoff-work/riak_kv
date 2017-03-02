@@ -108,7 +108,7 @@ initial_state() ->
 %%%% Mocking
 %% Don't mock lager, just start it if you need to. It does not require anything
 %% special and will work inside EQC.
-api_spec() ->
+api_spec() -> 
     #api_spec{
        language = erlang,
        modules  = [
@@ -117,9 +117,12 @@ api_spec() ->
                    #api_module{
                       name = app_helper, fallback = app_helper_mock,
                       functions = [] },
+                   % Most of the time we don't care about riak_kv_stat:update/1, but
+                   % in one place it helps us detect the correct termination, so we
+                   % check for that one case.
                    #api_module{
-                      name = riak_kv_stat,
-                      functions = [ #api_fun{ name = update, arity = 1} ]},
+                      name = riak_kv_stat, fallback = riak_kv_stat_mock,
+                      functions = [ #api_fun{ name = update, arity = 1, fallback = true} ]},
                    #api_module{
                       name = riak_core_bucket,
                       functions = [ #api_fun{ name = get_bucket, arity = 1} ]},
@@ -178,9 +181,10 @@ start_put_pre(S) ->
 %% @todo: mock riak_kv_get_put_monitor and avoid the parallelism with the
 %% KV_STAT_CALLOUT that it causes.
 start_put_callouts(_S, _Args) ->
-    ?PAR([
-          ?KV_STAT_CALLOUT
-         ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok)]).
+  %  ?PAR([
+      %    ?KV_STAT_CALLOUT
+         ?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok).
+     %    ]).
 
 
 start_put_post(_S, _Args, Pid) ->
@@ -223,7 +227,6 @@ start_prepare_pre(S) ->
 start_prepare_callouts(S, _Args) ->
     io:format("#"),
     {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S),
-%    ?APP_HELPER_CALLOUT([riak_core, default_bucket_props]),
     ?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
              (app_helper_mock:get_env(riak_core, default_bucket_props))),
     ?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
@@ -248,8 +251,8 @@ start_prepare_callouts(S, _Args) ->
                             {S#state.fake_fsm_pid, S#state.coordinator_tref, S#state.remote_coord_start_ref})),
             ?ASSERT(?MODULE, correct_options, [Options, S], 
                      {bad_coordinators_in_options, Options,
-                      should_have_matched, S#state.bad_coordinators}),
-            ?KV_STAT_CALLOUT
+                      should_have_matched, S#state.bad_coordinators})
+%            ?KV_STAT_CALLOUT
     end.
 
 
@@ -414,6 +417,12 @@ bad_coordinators() ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Helper functions
+
+
+%% fallback for riak_kv_stat:update/1
+update(_) ->
+    ok.
+
 
 riak_nodes() ->
 %%    [node_a, node_b, node_c, node()].
