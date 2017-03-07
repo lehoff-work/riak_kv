@@ -275,9 +275,9 @@ init({test, Args, StateProps}) ->
 init_statedata(From, RObj, Options0, Monitor) ->
     BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
     CoordTimeout = get_put_coordinator_failure_timeout(),
-    Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),
+    Trace = app_helper:get_env(riak_kv, fsm_trace_enabled, false),
     Options = proplists:unfold(Options0),
-    BadCoordinators = get_option(bad_coordinators, Options),
+    BadCoordinators = get_option(bad_coordinators, Options, []),
     StateData = #state{from = From,
                        robj = RObj,
                        bkey = BKey,
