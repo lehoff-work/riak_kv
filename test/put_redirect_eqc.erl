@@ -29,11 +29,6 @@
 -define(KEY, <<"da_key">>).
 -define(VALUE, 42).
 
-
--define(APP_HELPER_CALLOUT(Args), 
-        ?CALLOUT(app_helper, get_env, Args,
-                 erlang:apply(?MODULE, app_get_env, Args))).
-
 -define(KV_STAT_CALLOUT,
         ?CALLOUT(riak_kv_stat, update, [?WILDCARD], ok)).
 
@@ -245,9 +240,7 @@ start_prepare_pre(S) ->
 %% information to the coordinating node. Otherwise we will see the sibling problem in
 %% https://github.com/basho/riak_kv/issues/1188. 
 start_prepare_callouts(S, _Args) ->
-    io:format("#"),
     {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S),
-%    ?APP_HELPER_CALLOUT([riak_core, default_bucket_props]),
     ?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
              (app_helper_mock:get_env(riak_core, default_bucket_props))),
     ?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
@@ -258,14 +251,11 @@ start_prepare_callouts(S, _Args) ->
     % sloppy_quorum (true is default)2
     case should_node_coordinate(S) of
         true ->
-            io:format("*"),
             ?CALLOUT(riak_kv_put_fsm_comm, start_state, [validate], ok);
         false ->
-            io:format(">"),
             ?CALLOUT(riak_kv_util_mock, get_random_element, [?WILDCARD], 
                      APLChoice),
             ?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled),
-%            ?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true]),
             ?MATCH({Options, _},
                    ?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
                             [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], 
