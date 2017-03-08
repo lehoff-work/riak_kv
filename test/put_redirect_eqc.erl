@@ -207,7 +207,7 @@ start_put_next(S, Pid, [_From, _Object, PutOptions, Nodes]) ->
     S#state{fsm_pid = Pid,
             next_state = prepare,
             nodes = Nodes,
-            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions),
+            bad_coordinators = proplists:get_value(bad_coordinators, PutOptions, []),
             n_val = proplists:get_value(n_val, PutOptions)
            }.
 
@@ -278,7 +278,7 @@ start_prepare_callouts(S, _Args) ->
 
 
 correct_options(Options, S) ->
-    Expected = lists:usort(S#state.bad_coordinators),
+    Expected = lists:usort(maybe_bad_coordinators(S)),
     Sent = lists:usort(proplists:get_value(bad_coordinators, Options, [])),
     Expected == Sent.
 
@@ -440,11 +440,17 @@ new_object() ->
     riak_object:new({?BUCKET_TYPE, ?BUCKET}, ?KEY, ?VALUE).
 
 put_options() ->
+    oneof([default_put_options(), put_options_with_bad_coordinators()]).
+
+default_put_options() ->
     [{n_val, 3}, 
      {w, quorum}, 
      {chash_keyfun, {riak_core_util, chash_std_keyfun}},
-     {sloppy_quorum, true},
-     {bad_coordinators, bad_coordinators()}].
+     {sloppy_quorum, true}].
+
+put_options_with_bad_coordinators() ->
+    default_put_options() ++
+    [{bad_coordinators, bad_coordinators()}].
        
 bad_coordinators() ->
     elements([
@@ -469,11 +475,20 @@ is_node_primary(Nodes) ->
     lists:member(node(), lists:sublist(Nodes, 3)).
 
 should_node_coordinate(S) ->
-    is_node_primary(S#state.nodes -- S#state.bad_coordinators).
+    is_node_primary(determine_available_coordinators(S)).
 
 active_preflist(sloppy_quorum, S) ->
-    All = [{{0, N}, node_type(N)} || N <- (S#state.nodes -- S#state.bad_coordinators)],
+    All = [{{0, N}, node_type(N)} || N <- determine_available_coordinators(S)],
     lists:sublist(All, S#state.n_val).
+
+determine_available_coordinators(S) ->
+    (S#state.nodes -- maybe_bad_coordinators(S)).
+
+
+maybe_bad_coordinators(#state{bad_coordinators=undefined}) ->
+    [];
+maybe_bad_coordinators(#state{bad_coordinators = BadCoordinators}) ->
+    BadCoordinators.
 
 node_type(node_a) ->
     primary;
